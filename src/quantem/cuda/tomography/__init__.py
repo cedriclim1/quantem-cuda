@@ -1,5 +1,5 @@
-"""CUDA kernels accelerating quantem.tomography (K-Planes / INR object models)."""
+"""CUDA kernels accelerating quantem.tomography (no kernels yet).
 
-from quantem.cuda.tomography._ops import (
-    kplanes_tilted_fuse as kplanes_tilted_fuse,
-)
+K-Planes / tensor-decomposition kernels used by the tomography object models
+live in ``quantem.cuda.core.ml``, mirroring their home in quantem.
+"""

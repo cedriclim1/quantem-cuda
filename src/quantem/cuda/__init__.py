@@ -13,6 +13,10 @@ torch custom ops, so they compose with autograd and ``torch.compile``.
 from importlib.metadata import version
 
 from quantem.cuda import core as core
+from quantem.cuda import diffraction as diffraction
+from quantem.cuda import diffractive_imaging as diffractive_imaging
+from quantem.cuda import imaging as imaging
+from quantem.cuda import spectroscopy as spectroscopy
 from quantem.cuda import tomography as tomography
 from quantem.cuda._common import cudart_version as cudart_version
 

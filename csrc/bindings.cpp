@@ -24,5 +24,5 @@ PYBIND11_MODULE(_core, m) {
     m.attr("__cudart_version__") = CUDART_VERSION;
 
     quantem_cuda::register_core_ops(m);
-    quantem_cuda::register_tomography_ops(m);
+    quantem_cuda::register_core_ml_ops(m);
 }

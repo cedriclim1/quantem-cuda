@@ -23,11 +23,14 @@ every public function takes and returns `torch.Tensor`.
 - **CUDA-only.** There is no CPU fallback; pure-torch reference implementations live in the
   consuming code (and in `tests/`, where they verify the kernels).
 - **Submodules mirror quantem.** Kernels are grouped by the `quantem` module they
-  accelerate — `quantem.cuda.tomography`, `quantem.cuda.diffractive_imaging`, ... — with
-  `quantem.cuda.core` holding kernels shared across modules (e.g. regularizers). The same
-  split runs through `csrc/` (`ops/<module>.h`, `cuda/<module>/*.cu`,
-  `bindings/<module>.cpp`), `tests/`, and `benchmarks/`. Submodules are added when their
-  first kernel lands.
+  accelerate — `quantem.cuda.tomography`, `quantem.cuda.diffractive_imaging`,
+  `quantem.cuda.imaging`, `quantem.cuda.diffraction`, `quantem.cuda.spectroscopy` — with
+  `quantem.cuda.core` holding kernels shared across modules: `core` itself for
+  regularizers / volume ops, `core.ml` for the ML model kernels mirroring
+  `quantem.core.ml` (K-Planes / tensor decompositions). The same split runs through
+  `csrc/` (`ops/<module>.h`, `cuda/<module>/*.cu`, `bindings/<module>.cpp`), `tests/`,
+  and `benchmarks/`. All submodules exist as scaffolds; a kernel goes in the submodule
+  named after the quantem module that owns the code it accelerates.
 
 ## Installation
 
@@ -73,11 +76,15 @@ loss = data_fidelity + 1e-3 * tv_loss_iso_3d(volume)
 loss.backward()
 ```
 
-### `quantem.cuda.tomography`
+### `quantem.cuda.core.ml` — ML model kernels (mirrors `quantem.core.ml`)
 
 | Function | Description |
 | --- | --- |
 | `kplanes_tilted_fuse(pts, rotations, plane)` | Fused TILTED K-Planes feature interpolation (one multiscale level): rotate → bilinear-sample 3 planes per rotation → Hadamard product, with analytic gradients w.r.t. points, rotations, and plane grids. Exactly matches `quantem`'s `interpolate_ms_features_tilted` per level. |
+
+`quantem`'s `KPlanesTILTED` model lives in `quantem.core.ml.models.kplanes` and is shared
+across applications (tomography object models today); its kernels live here for the same
+reason.
 
 ## Development
 

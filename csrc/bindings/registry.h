@@ -21,7 +21,7 @@ inline cudaStream_t to_stream(long stream_ptr) {
 /* quantem.cuda.core — shared kernels (TV regularizers). */
 void register_core_ops(pybind11::module_ &m);
 
-/* quantem.cuda.tomography — K-Planes / INR object-model kernels. */
-void register_tomography_ops(pybind11::module_ &m);
+/* quantem.cuda.core.ml — K-Planes / tensor-decomposition model kernels. */
+void register_core_ml_ops(pybind11::module_ &m);
 
 }  // namespace quantem_cuda

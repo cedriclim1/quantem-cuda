@@ -1,7 +1,8 @@
-/* ── csrc/bindings/tomography.cpp ────────────────────────────────────────
- * Raw-pointer bindings for the quantem.cuda.tomography kernels (K-Planes /
- * INR object models). Registered into the single `_core` extension by
- * csrc/bindings.cpp; see csrc/bindings/registry.h for the conventions.
+/* ── csrc/bindings/core/ml.cpp ───────────────────────────────────────────
+ * Raw-pointer bindings for the quantem.cuda.core.ml kernels (K-Planes /
+ * tensor-decomposition models). Registered into the single `_core`
+ * extension by csrc/bindings.cpp; see csrc/bindings/registry.h for the
+ * conventions.
  */
 
 #include <pybind11/pybind11.h>
@@ -9,7 +10,7 @@
 #include <cuda_runtime.h>
 
 #include "bindings/registry.h"
-#include "ops/tomography.h"
+#include "ops/core/ml.h"
 
 namespace py = pybind11;
 
@@ -49,7 +50,7 @@ static void py_kplanes_tilted_fuse_grad_cuda(
     );
 }
 
-void register_tomography_ops(py::module_ &m) {
+void register_core_ml_ops(py::module_ &m) {
     m.def("kplanes_tilted_fuse_cuda", &py_kplanes_tilted_fuse_cuda,
           "Fused TILTED K-Planes interpolation (one level). pts_ptr: fp32 "
           "[B,3]; r_ptr: fp32 [T,3,3]; grid_ptr: fp32 [3T,C,H,W]; out_ptr: "

@@ -1,7 +1,7 @@
 #pragma once
-/* ── csrc/ops/tomography.h ───────────────────────────────────────────────
- * Host-side launcher declarations for the tomography CUDA kernels
- * (K-Planes / INR object models). All launchers are asynchronous on
+/* ── csrc/ops/core/ml.h ──────────────────────────────────────────────────
+ * Host-side launcher declarations for the core.ml CUDA kernels (K-Planes /
+ * tensor-decomposition models). All launchers are asynchronous on
  * `stream`; error checking is launch-time only (see CUDA_CHECK_KERNEL in
  * common.cuh).
  */

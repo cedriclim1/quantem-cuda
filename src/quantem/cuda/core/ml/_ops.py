@@ -1,4 +1,4 @@
-"""torch-native registration of the tomography kernels.
+"""torch-native registration of the core.ml kernels (K-Planes models).
 
 Same conventions as the package's other ``_ops.py`` layers: each kernel
 pair is a ``torch.library.custom_op`` (forward) plus a companion backward

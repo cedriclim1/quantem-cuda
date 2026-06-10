@@ -1,4 +1,4 @@
-/* ── csrc/cuda/tomography/kplanes_tilted.cu ─────────────────────────────────────────
+/* ── csrc/cuda/core/ml/kplanes_tilted.cu ────────────────────────────────────────────
  * Fused TILTED K-Planes feature interpolation (one multiscale level).
  *
  * Replaces the torch chain
@@ -55,7 +55,7 @@
  */
 
 #include "common.cuh"
-#include "ops/tomography.h"
+#include "ops/core/ml.h"
 
 namespace {
 
