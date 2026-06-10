@@ -1,4 +1,4 @@
-"""torch-native registration of the compiled kernels.
+"""torch-native registration of the shared (cross-module) kernels.
 
 Each kernel pair is exposed as a ``torch.library.custom_op`` (forward) plus
 a companion backward op, wired together with ``register_autograd`` and given
@@ -26,14 +26,7 @@ import torch
 from torch import Tensor
 
 from quantem.cuda import _core
-
-
-def _launch_args(volume: Tensor) -> tuple[Tensor, int, int, int, int, int]:
-    vol = volume.contiguous()
-    b, d, h, w = vol.shape
-    stream = torch.cuda.current_stream(vol.device).cuda_stream
-    return vol, b, d, h, w, stream
-
+from quantem.cuda._common import _as_batched, _launch_args
 
 # ── isotropic 3-D TV ──────────────────────────────────────────────────────
 
@@ -149,19 +142,6 @@ _tv_loss_sq_3d.register_autograd(_sq_backward, setup_context=_sq_setup_context)
 # ── public wrappers ───────────────────────────────────────────────────────
 
 
-def _as_batched(volume: Tensor, fn: str) -> Tensor:
-    if volume.ndim < 3:
-        raise ValueError(
-            f"{fn} expects [..., D, H, W] with ndim >= 3, got shape {tuple(volume.shape)}"
-        )
-    if volume.dtype != torch.float32:
-        raise TypeError(f"{fn} is fp32-only (got {volume.dtype}).")
-    if not volume.is_cuda:
-        raise ValueError(f"{fn} requires a CUDA tensor (got device {volume.device}).")
-    d, h, w = volume.shape[-3:]
-    return volume.reshape(-1, d, h, w)
-
-
 def tv_loss_iso_3d(volume: Tensor, eps: float = 1e-8) -> Tensor:
     """Isotropic 3-D total-variation loss (fused CUDA forward + backward).
 
@@ -199,8 +179,3 @@ def tv_loss_sq_3d(volume: Tensor) -> Tensor:
         0-dim fp32 tensor on the same device as ``volume``; differentiable.
     """
     return _tv_loss_sq_3d(_as_batched(volume, "tv_loss_sq_3d"))
-
-
-def cudart_version() -> int:
-    """CUDA runtime version the extension was compiled against (e.g. 13000)."""
-    return int(_core.__cudart_version__)

@@ -1,5 +1,5 @@
 #pragma once
-/* ── csrc/ops.h ──────────────────────────────────────────────────────────
+/* ── csrc/ops/core.h ──────────────────────────────────────────────────────────
  * Host-side launcher declarations for the CUDA kernels. All launchers are
  * asynchronous on `stream`; error checking is launch-time only (see
  * CUDA_CHECK_KERNEL in common.cuh).

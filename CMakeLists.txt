@@ -131,7 +131,8 @@ endif()
 
 pybind11_add_module(_core
     csrc/bindings.cpp
-    csrc/cuda/tv_loss.cu
+    csrc/bindings/core.cpp
+    csrc/cuda/core/tv_loss.cu
 )
 target_include_directories(_core PRIVATE csrc)
 target_link_libraries(_core PRIVATE CUDA::cudart)
