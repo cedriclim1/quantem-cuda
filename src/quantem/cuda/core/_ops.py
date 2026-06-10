@@ -179,3 +179,81 @@ def tv_loss_sq_3d(volume: Tensor) -> Tensor:
         0-dim fp32 tensor on the same device as ``volume``; differentiable.
     """
     return _tv_loss_sq_3d(_as_batched(volume, "tv_loss_sq_3d"))
+
+
+# ── L1-anisotropic 3-D TV (per-axis sums) ─────────────────────────────────
+
+
+@torch.library.custom_op("quantem_cuda::tv_loss_l1_3d", mutates_args=())
+def _tv_loss_l1_3d(volume: Tensor) -> Tensor:
+    vol, b, d, h, w, stream = _launch_args(volume)
+    acc = torch.zeros(3, dtype=torch.float32, device=vol.device)
+    with torch.cuda.device(vol.device):
+        _core.tv_loss_l1_3d_cuda(vol.data_ptr(), acc.data_ptr(), b, d, h, w, stream)
+    return acc
+
+
+@_tv_loss_l1_3d.register_fake
+def _(volume: Tensor) -> Tensor:
+    return volume.new_empty((3,))
+
+
+@torch.library.custom_op("quantem_cuda::tv_loss_l1_3d_bwd", mutates_args=())
+def _tv_loss_l1_3d_bwd(volume: Tensor, grad_out: Tensor) -> Tensor:
+    vol, b, d, h, w, stream = _launch_args(volume)
+    g = grad_out.detach().to(dtype=torch.float32, device=vol.device).reshape(3).contiguous()
+    grad_vol = torch.empty_like(vol)
+    with torch.cuda.device(vol.device):
+        _core.tv_loss_l1_3d_grad_cuda(
+            vol.data_ptr(), g.data_ptr(), grad_vol.data_ptr(), b, d, h, w, stream
+        )
+    return grad_vol
+
+
+@_tv_loss_l1_3d_bwd.register_fake
+def _(volume: Tensor, grad_out: Tensor) -> Tensor:
+    return torch.empty_like(volume)
+
+
+def _l1_setup_context(ctx, inputs, output) -> None:
+    (volume,) = inputs
+    ctx.save_for_backward(volume)
+
+
+def _l1_backward(ctx, grad_out):
+    (volume,) = ctx.saved_tensors
+    return _tv_loss_l1_3d_bwd(volume, grad_out)
+
+
+_tv_loss_l1_3d.register_autograd(_l1_backward, setup_context=_l1_setup_context)
+
+
+def tv_loss_l1_3d(volume: Tensor) -> Tensor:
+    """Per-axis L1-anisotropic 3-D total-variation sums (fused CUDA kernels).
+
+        sums = [ Σ|Δd|, Σ|Δh|, Σ|Δw| ]
+
+    over forward differences along the three trailing dims, each summed
+    over its full complementary index range. The sums are raw and
+    unnormalized; weighting and normalization stay with the caller so any
+    per-axis scheme is exact. quantem's ptychography
+    ``ObjectConstraints._calc_tv_loss(array, (w_z, w_xy))`` on a
+    ``[S, H, W]`` array (S > 1) is::
+
+        sums = tv_loss_l1_3d(array)
+        means = sums / sums.new_tensor(
+            [(S - 1) * H * W, S * (H - 1) * W, S * H * (W - 1)]
+        )
+        loss = (w_z * means[0] + w_xy * means[1] + w_xy * means[2]) / n_active_axes
+
+    A trailing dim of size 1 contributes an (empty) sum of 0. The gradient
+    follows torch's convention for ``|x|`` at zero: ``sign(0) = 0``.
+
+    Args:
+        volume: fp32 CUDA tensor, shape ``[D, H, W]`` or ``[..., D, H, W]``.
+
+    Returns:
+        Shape-``(3,)`` fp32 tensor on the same device as ``volume``;
+        differentiable.
+    """
+    return _tv_loss_l1_3d(_as_batched(volume, "tv_loss_l1_3d"))

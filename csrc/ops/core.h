@@ -54,3 +54,25 @@ void tv_loss_sq_3d_grad_cuda(
     int B, int D, int H, int W,
     cudaStream_t stream
 );
+
+/* L1-anisotropic 3-D TV: acc[axis] += Σ_b Σ |forward difference| along
+ * that axis (full complementary index range, like the squared variant,
+ * but per-axis). acc is a 3-element fp32 device array the caller
+ * pre-zeroes; weighting/normalization happen in Python. */
+void tv_loss_l1_3d_cuda(
+    const float *d_vol,
+    float       *d_acc,
+    int B, int D, int H, int W,
+    cudaStream_t stream
+);
+
+/* Backward of the L1-anisotropic TV sums. g is a 3-element fp32 device
+ * array holding the per-axis upstream grads; grad_vol is written, not
+ * accumulated. d|x|/dx = sign(x) with sign(0) = 0 (torch convention). */
+void tv_loss_l1_3d_grad_cuda(
+    const float *d_vol,
+    const float *d_g,
+    float       *d_grad_vol,
+    int B, int D, int H, int W,
+    cudaStream_t stream
+);

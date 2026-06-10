@@ -1,7 +1,7 @@
 /* ── csrc/cuda/core/tv_loss.cu ────────────────────────────────────────────────
  * Fused 3-D Total-Variation losses + analytic gradients, batched over a
  * flattened leading dim B (channels and/or batch; B = 1 for a plain
- * volume). Two variants:
+ * volume). Three variants:
  *
  * Isotropic (corner-driven, half-pixel-shifted formulation):
  *
@@ -22,8 +22,15 @@
  *   i.e. each axis sums its forward differences over the full
  *   complementary index range — no corner restriction, no sqrt.
  *
+ * L1-anisotropic (matches quantem's ptychography _calc_tv_loss functional):
+ *
+ *   sums(vol)[axis] = Σ_n Σ |Δ_axis|, same index ranges as the squared
+ *   variant, but the three axes accumulate into separate accumulators so
+ *   the caller can weight/normalize each axis independently (z vs xy
+ *   weights). Gradient convention: d|x|/dx = sign(x), sign(0) = 0.
+ *
  * Forward kernels reduce block-locally in shared memory → one atomicAdd
- * per block into a single fp32 accumulator. Backward kernels are
+ * per block into a single fp32 accumulator (three for L1). Backward kernels are
  * voxel-driven gathers that recompute differences from `vol` and write
  * (not accumulate) grad_vol; callers pre-zero acc and may rely on every
  * voxel being written by the gradient kernels.
@@ -339,6 +346,149 @@ void tv_loss_sq_3d_grad_cuda(
               (unsigned)(grid_z < 65535 ? grid_z : 65535));
 
     tv_loss_sq_3d_grad_kernel<<<grid, block, 0, stream>>>(
+        d_vol, d_g, d_grad_vol, B, D, H, W
+    );
+    CUDA_CHECK_KERNEL();
+}
+
+/* ── L1-anisotropic forward ───────────────────────────────────────────── */
+
+__global__ static void tv_loss_l1_3d_kernel(
+    const float *__restrict__ vol,    /* [B, D, H, W] */
+    float       *__restrict__ acc,    /* [3] — per-axis Σ|diff|, atomicAdd */
+    int B, int D, int H, int W
+) {
+    /* Voxel-driven like the squared kernel, but the three axes accumulate
+     * separately so the caller can weight/normalize each axis on its own
+     * (quantem's ptychography TV uses distinct z and xy weights). */
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = blockIdx.y * blockDim.y + threadIdx.y;
+
+    long long n_slabs = (long long)B * D;
+    size_t plane = (size_t)H * W;
+
+    float ld = 0.0f, lh = 0.0f, lw = 0.0f;
+    if (b < H && c < W) {
+        for (long long z = (long long)blockIdx.z * blockDim.z + threadIdx.z;
+             z < n_slabs;
+             z += (long long)gridDim.z * blockDim.z) {
+            int n = (int)(z / D);
+            int a = (int)(z % D);
+            size_t base = ((size_t)n * D + a) * plane + (size_t)b * W + c;
+            float v = vol[base];
+
+            if (a < D - 1) ld += fabsf(vol[base + plane] - v);
+            if (b < H - 1) lh += fabsf(vol[base + (size_t)W] - v);
+            if (c < W - 1) lw += fabsf(vol[base + 1] - v);
+        }
+    }
+
+    /* Block-level reduction, one shared-memory segment per axis. */
+    extern __shared__ float smem[];
+    int tid = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
+    int nthreads = blockDim.x * blockDim.y * blockDim.z;
+    smem[tid] = ld;
+    smem[nthreads + tid] = lh;
+    smem[2 * nthreads + tid] = lw;
+    __syncthreads();
+
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            smem[tid] += smem[tid + s];
+            smem[nthreads + tid] += smem[nthreads + tid + s];
+            smem[2 * nthreads + tid] += smem[2 * nthreads + tid + s];
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        atomicAdd(&acc[0], smem[0]);
+        atomicAdd(&acc[1], smem[nthreads]);
+        atomicAdd(&acc[2], smem[2 * nthreads]);
+    }
+}
+
+void tv_loss_l1_3d_cuda(
+    const float *d_vol,
+    float       *d_acc,
+    int B, int D, int H, int W,
+    cudaStream_t stream
+) {
+    long long n_slabs = (long long)B * D;
+    dim3 block(32, 4, 2);
+    long long grid_z = (n_slabs + block.z - 1) / block.z;
+    dim3 grid((W + block.x - 1) / block.x,
+              (H + block.y - 1) / block.y,
+              (unsigned)(grid_z < 65535 ? grid_z : 65535));
+
+    size_t smem_bytes = 3 * block.x * block.y * block.z * sizeof(float);
+    tv_loss_l1_3d_kernel<<<grid, block, smem_bytes, stream>>>(
+        d_vol, d_acc, B, D, H, W
+    );
+    CUDA_CHECK_KERNEL();
+}
+
+/* ── L1-anisotropic backward ──────────────────────────────────────────── */
+
+/* torch convention for d|x|/dx: sign(x) with sign(0) = 0. */
+__device__ __forceinline__ float sgnf(float x) {
+    return (float)((x > 0.0f) - (x < 0.0f));
+}
+
+__global__ static void tv_loss_l1_3d_grad_kernel(
+    const float *__restrict__ vol,         /* [B, D, H, W] */
+    const float *__restrict__ g,           /* [3] — per-axis upstream grads */
+    float       *__restrict__ grad_vol,    /* [B, D, H, W] */
+    int B, int D, int H, int W
+) {
+    int c = blockIdx.x * blockDim.x + threadIdx.x;
+    int b = blockIdx.y * blockDim.y + threadIdx.y;
+    if (b >= H || c >= W) return;
+
+    float gd = __ldg(&g[0]);
+    float gh = __ldg(&g[1]);
+    float gw = __ldg(&g[2]);
+    long long n_slabs = (long long)B * D;
+    size_t plane = (size_t)H * W;
+
+    for (long long z = (long long)blockIdx.z * blockDim.z + threadIdx.z;
+         z < n_slabs;
+         z += (long long)gridDim.z * blockDim.z) {
+        int n = (int)(z / D);
+        int a = (int)(z % D);
+        size_t base = ((size_t)n * D + a) * plane + (size_t)b * W + c;
+        float v = vol[base];
+
+        /* |next − v| contributes −sign(next − v); |v − prev| contributes
+         * +sign(v − prev); each term present only where the difference
+         * exists. Axes carry independent upstream grads. */
+        float acc = 0.0f;
+        if (a < D - 1) acc -= gd * sgnf(vol[base + plane] - v);
+        if (a >= 1)    acc += gd * sgnf(v - vol[base - plane]);
+        if (b < H - 1) acc -= gh * sgnf(vol[base + (size_t)W] - v);
+        if (b >= 1)    acc += gh * sgnf(v - vol[base - (size_t)W]);
+        if (c < W - 1) acc -= gw * sgnf(vol[base + 1] - v);
+        if (c >= 1)    acc += gw * sgnf(v - vol[base - 1]);
+
+        grad_vol[base] = acc;
+    }
+}
+
+void tv_loss_l1_3d_grad_cuda(
+    const float *d_vol,
+    const float *d_g,
+    float       *d_grad_vol,
+    int B, int D, int H, int W,
+    cudaStream_t stream
+) {
+    long long n_slabs = (long long)B * D;
+    dim3 block(32, 4, 2);
+    long long grid_z = (n_slabs + block.z - 1) / block.z;
+    dim3 grid((W + block.x - 1) / block.x,
+              (H + block.y - 1) / block.y,
+              (unsigned)(grid_z < 65535 ? grid_z : 65535));
+
+    tv_loss_l1_3d_grad_kernel<<<grid, block, 0, stream>>>(
         d_vol, d_g, d_grad_vol, B, D, H, W
     );
     CUDA_CHECK_KERNEL();

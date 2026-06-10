@@ -63,9 +63,10 @@ env, or the system. Compiled architectures default to `75;80;86;90;100;120`; ove
 | --- | --- |
 | `tv_loss_iso_3d(volume, eps)` | Isotropic 3-D total-variation loss (corner-restricted, `sqrt(dd²+dh²+dw²+eps)`), mean-reduced; fused forward + analytic gradient. |
 | `tv_loss_sq_3d(volume)` | Squared-anisotropic 3-D TV sum, exactly matching `quantem`'s `tv_vol` regularizer; fused forward + analytic gradient. |
+| `tv_loss_l1_3d(volume)` | L1-anisotropic TV: per-axis raw `Σ\|forward diff\|` sums, returned as a shape-`(3,)` tensor so per-axis weights/normalization stay with the caller — composes to exactly `quantem`'s ptychography `_calc_tv_loss` functional; fused forward + analytic gradient (`sign(0) = 0`). |
 
-Both accept `[D, H, W]` or `[..., D, H, W]` fp32 CUDA tensors (leading channel/batch dims
-are flattened) and return a differentiable 0-dim tensor:
+All accept `[D, H, W]` or `[..., D, H, W]` fp32 CUDA tensors (leading channel/batch dims
+are flattened) and return a differentiable 0-dim tensor (`(3,)` for the per-axis L1 sums):
 
 ```python
 import torch
