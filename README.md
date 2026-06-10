@@ -52,6 +52,7 @@ env, or the system. Compiled architectures default to `75;80;86;90;100;120`; ove
 | --- | --- |
 | `tv_loss_iso_3d(volume, eps)` | Isotropic 3-D total-variation loss (corner-restricted, `sqrt(dd²+dh²+dw²+eps)`), mean-reduced; fused forward + analytic gradient. |
 | `tv_loss_sq_3d(volume)` | Squared-anisotropic 3-D TV sum, exactly matching `quantem`'s `tv_vol` regularizer; fused forward + analytic gradient. |
+| `kplanes_tilted_fuse(pts, rotations, plane)` | Fused TILTED K-Planes feature interpolation (one multiscale level): rotate → bilinear-sample 3 planes per rotation → Hadamard product, with analytic gradients w.r.t. points, rotations, and plane grids. Exactly matches `quantem`'s `interpolate_ms_features_tilted` per level. |
 
 Both accept `[D, H, W]` or `[..., D, H, W]` fp32 CUDA tensors (leading channel/batch dims
 are flattened) and return a differentiable 0-dim tensor:

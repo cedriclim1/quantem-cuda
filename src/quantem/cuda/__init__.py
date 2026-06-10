@@ -12,6 +12,7 @@ from importlib.metadata import version
 
 from quantem.cuda._ops import (
     cudart_version as cudart_version,
+    kplanes_tilted_fuse as kplanes_tilted_fuse,
     tv_loss_iso_3d as tv_loss_iso_3d,
     tv_loss_sq_3d as tv_loss_sq_3d,
 )
