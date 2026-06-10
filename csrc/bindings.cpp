@@ -1,0 +1,115 @@
+/* ── csrc/bindings.cpp ───────────────────────────────────────────────────
+ * pybind11 module `quantem.cuda._core`.
+ *
+ * The binding layer is deliberately torch-free: tensors cross the boundary
+ * as raw device pointers (`tensor.data_ptr()`) plus shape ints and the
+ * caller's CUDA stream handle. Keeping libtorch out of the link line is
+ * what lets one compiled wheel work across PyTorch versions — the only
+ * shared dependency is libcudart, which resolves to the copy PyTorch has
+ * already loaded at import time. All torch-facing niceties (autograd,
+ * torch.compile registration, validation) live in quantem/cuda/_ops.py.
+ */
+
+#include <pybind11/pybind11.h>
+
+#include <cuda_runtime.h>
+
+#include "ops.h"
+
+namespace py = pybind11;
+
+static cudaStream_t to_stream(long stream_ptr) {
+    return reinterpret_cast<cudaStream_t>(stream_ptr);
+}
+
+static void py_tv_loss_iso_3d_cuda(
+    long vol_ptr, long acc_ptr,
+    int B, int D, int H, int W,
+    float eps,
+    long stream_ptr
+) {
+    tv_loss_iso_3d_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<float *>(acc_ptr),
+        B, D, H, W, eps,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_tv_loss_iso_3d_grad_cuda(
+    long vol_ptr, long g_scaled_ptr, long grad_vol_ptr,
+    int B, int D, int H, int W,
+    float eps,
+    long stream_ptr
+) {
+    tv_loss_iso_3d_grad_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<const float *>(g_scaled_ptr),
+        reinterpret_cast<float *>(grad_vol_ptr),
+        B, D, H, W, eps,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_tv_loss_sq_3d_cuda(
+    long vol_ptr, long acc_ptr,
+    int B, int D, int H, int W,
+    long stream_ptr
+) {
+    tv_loss_sq_3d_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<float *>(acc_ptr),
+        B, D, H, W,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_tv_loss_sq_3d_grad_cuda(
+    long vol_ptr, long g_ptr, long grad_vol_ptr,
+    int B, int D, int H, int W,
+    long stream_ptr
+) {
+    tv_loss_sq_3d_grad_cuda(
+        reinterpret_cast<const float *>(vol_ptr),
+        reinterpret_cast<const float *>(g_ptr),
+        reinterpret_cast<float *>(grad_vol_ptr),
+        B, D, H, W,
+        to_stream(stream_ptr)
+    );
+}
+
+PYBIND11_MODULE(_core, m) {
+    m.doc() = "quantem-cuda compiled kernels (raw-pointer API; use quantem.cuda instead)";
+    m.attr("__cudart_version__") = CUDART_VERSION;
+
+    m.def("tv_loss_iso_3d_cuda", &py_tv_loss_iso_3d_cuda,
+          "Isotropic 3-D TV forward. vol_ptr: fp32 [B,D,H,W]; acc_ptr: "
+          "pre-zeroed single-element fp32 accumulator (unnormalized corner "
+          "sum on return).",
+          py::arg("vol_ptr"), py::arg("acc_ptr"),
+          py::arg("B"), py::arg("D"), py::arg("H"), py::arg("W"),
+          py::arg("eps"), py::arg("stream_ptr"));
+
+    m.def("tv_loss_iso_3d_grad_cuda", &py_tv_loss_iso_3d_grad_cuda,
+          "Backward of tv_loss_iso_3d. g_scaled_ptr: single-element fp32 "
+          "device scalar = upstream_grad / N. grad_vol is fully written.",
+          py::arg("vol_ptr"), py::arg("g_scaled_ptr"), py::arg("grad_vol_ptr"),
+          py::arg("B"), py::arg("D"), py::arg("H"), py::arg("W"),
+          py::arg("eps"), py::arg("stream_ptr"));
+
+    m.def("tv_loss_sq_3d_cuda", &py_tv_loss_sq_3d_cuda,
+          "Squared-anisotropic 3-D TV forward (quantem tv_vol parity). "
+          "acc_ptr: pre-zeroed single-element fp32 accumulator "
+          "(unnormalized Σ diff² on return).",
+          py::arg("vol_ptr"), py::arg("acc_ptr"),
+          py::arg("B"), py::arg("D"), py::arg("H"), py::arg("W"),
+          py::arg("stream_ptr"));
+
+    m.def("tv_loss_sq_3d_grad_cuda", &py_tv_loss_sq_3d_grad_cuda,
+          "Backward of tv_loss_sq_3d. g_ptr: single-element fp32 device "
+          "scalar = raw upstream grad (factor 2 applied in-kernel). "
+          "grad_vol is fully written.",
+          py::arg("vol_ptr"), py::arg("g_ptr"), py::arg("grad_vol_ptr"),
+          py::arg("B"), py::arg("D"), py::arg("H"), py::arg("W"),
+          py::arg("stream_ptr"));
+}
