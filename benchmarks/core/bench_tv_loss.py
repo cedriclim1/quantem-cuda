@@ -7,7 +7,7 @@ Run on a CUDA machine:
 
 import torch
 
-from quantem.cuda import tv_loss_iso_3d, tv_loss_sq_3d
+from quantem.cuda.core import tv_loss_iso_3d, tv_loss_sq_3d
 
 SHAPES = [(256, 256, 256), (4, 256, 256, 256), (512, 512, 512)]
 N_WARMUP = 5

@@ -1,4 +1,4 @@
-/* ── csrc/cuda/tv_loss.cu ────────────────────────────────────────────────
+/* ── csrc/cuda/core/tv_loss.cu ────────────────────────────────────────────────
  * Fused 3-D Total-Variation losses + analytic gradients, batched over a
  * flattened leading dim B (channels and/or batch; B = 1 for a plain
  * volume). Two variants:
@@ -33,7 +33,7 @@
  */
 
 #include "common.cuh"
-#include "ops.h"
+#include "ops/core.h"
 
 /* ── isotropic forward ────────────────────────────────────────────────── */
 

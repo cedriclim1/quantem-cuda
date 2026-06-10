@@ -10,7 +10,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quantem.cuda import kplanes_tilted_fuse
+from quantem.cuda.tomography import kplanes_tilted_fuse
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 

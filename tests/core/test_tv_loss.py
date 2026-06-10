@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from quantem.cuda import tv_loss_iso_3d, tv_loss_sq_3d
+from quantem.cuda.core import tv_loss_iso_3d, tv_loss_sq_3d
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 

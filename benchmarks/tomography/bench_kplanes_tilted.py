@@ -7,7 +7,7 @@ samples_per_ray points per training batch.
 import torch
 import torch.nn.functional as F
 
-from quantem.cuda import kplanes_tilted_fuse
+from quantem.cuda.tomography import kplanes_tilted_fuse
 
 # (label, B, T, C, H, W)
 CONFIGS = [

@@ -22,6 +22,12 @@ every public function takes and returns `torch.Tensor`.
   carry compiled code.
 - **CUDA-only.** There is no CPU fallback; pure-torch reference implementations live in the
   consuming code (and in `tests/`, where they verify the kernels).
+- **Submodules mirror quantem.** Kernels are grouped by the `quantem` module they
+  accelerate — `quantem.cuda.tomography`, `quantem.cuda.diffractive_imaging`, ... — with
+  `quantem.cuda.core` holding kernels shared across modules (e.g. regularizers). The same
+  split runs through `csrc/` (`ops/<module>.h`, `cuda/<module>/*.cu`,
+  `bindings/<module>.cpp`), `tests/`, and `benchmarks/`. Submodules are added when their
+  first kernel lands.
 
 ## Installation
 
@@ -48,23 +54,30 @@ env, or the system. Compiled architectures default to `75;80;86;90;100;120`; ove
 
 ## Kernels
 
+### `quantem.cuda.core` — shared
+
 | Function | Description |
 | --- | --- |
 | `tv_loss_iso_3d(volume, eps)` | Isotropic 3-D total-variation loss (corner-restricted, `sqrt(dd²+dh²+dw²+eps)`), mean-reduced; fused forward + analytic gradient. |
 | `tv_loss_sq_3d(volume)` | Squared-anisotropic 3-D TV sum, exactly matching `quantem`'s `tv_vol` regularizer; fused forward + analytic gradient. |
-| `kplanes_tilted_fuse(pts, rotations, plane)` | Fused TILTED K-Planes feature interpolation (one multiscale level): rotate → bilinear-sample 3 planes per rotation → Hadamard product, with analytic gradients w.r.t. points, rotations, and plane grids. Exactly matches `quantem`'s `interpolate_ms_features_tilted` per level. |
 
 Both accept `[D, H, W]` or `[..., D, H, W]` fp32 CUDA tensors (leading channel/batch dims
 are flattened) and return a differentiable 0-dim tensor:
 
 ```python
 import torch
-from quantem.cuda import tv_loss_iso_3d
+from quantem.cuda.core import tv_loss_iso_3d
 
 volume = torch.rand(256, 256, 256, device="cuda", requires_grad=True)
 loss = data_fidelity + 1e-3 * tv_loss_iso_3d(volume)
 loss.backward()
 ```
+
+### `quantem.cuda.tomography`
+
+| Function | Description |
+| --- | --- |
+| `kplanes_tilted_fuse(pts, rotations, plane)` | Fused TILTED K-Planes feature interpolation (one multiscale level): rotate → bilinear-sample 3 planes per rotation → Hadamard product, with analytic gradients w.r.t. points, rotations, and plane grids. Exactly matches `quantem`'s `interpolate_ms_features_tilted` per level. |
 
 ## Development
 
@@ -73,10 +86,14 @@ git clone https://github.com/electronmicroscopy/quantem-cuda
 cd quantem-cuda
 uv sync                              # builds the extension into the venv
 uv run pytest tests                  # GPU tests auto-skip without a CUDA device
-uv run python benchmarks/bench_tv_loss.py
+uv run python benchmarks/core/bench_tv_loss.py
 ```
 
-Kernel sources live in `csrc/cuda/`, the pybind11 binding in `csrc/bindings.cpp`, and the
-torch registration layer in `src/quantem/cuda/_ops.py`. New kernels should follow the same
-pattern: a raw-pointer launcher declared in `csrc/ops.h`, a `custom_op` pair in `_ops.py`,
-and a pure-torch reference implementation in `tests/`.
+Kernel sources live in `csrc/cuda/<module>/`, their raw-pointer bindings in
+`csrc/bindings/<module>.cpp` (assembled into the single `_core` extension by
+`csrc/bindings.cpp`), and the torch registration layer in
+`src/quantem/cuda/<module>/_ops.py`. New kernels should follow the same pattern: a
+launcher declared in `csrc/ops/<module>.h`, a `custom_op` pair in the submodule's
+`_ops.py`, and a pure-torch reference implementation in `tests/<module>/`. A kernel goes
+in the submodule named after the `quantem` module it accelerates; kernels useful across
+modules go in `core`.

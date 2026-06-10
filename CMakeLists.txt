@@ -131,8 +131,10 @@ endif()
 
 pybind11_add_module(_core
     csrc/bindings.cpp
-    csrc/cuda/tv_loss.cu
-    csrc/cuda/kplanes_tilted.cu
+    csrc/bindings/core.cpp
+    csrc/bindings/tomography.cpp
+    csrc/cuda/core/tv_loss.cu
+    csrc/cuda/tomography/kplanes_tilted.cu
 )
 target_include_directories(_core PRIVATE csrc)
 target_link_libraries(_core PRIVATE CUDA::cudart)
