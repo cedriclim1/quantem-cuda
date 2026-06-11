@@ -86,7 +86,54 @@ static void py_kplanes_tilted_tv_fuse_grad_cuda(
     );
 }
 
+static void py_kplanes_fuse_cuda(
+    long pts_ptr, long grid_ptr, long out_ptr,
+    long B, int C, int H, int W,
+    long stream_ptr
+) {
+    kplanes_fuse_cuda(
+        reinterpret_cast<const float *>(pts_ptr),
+        reinterpret_cast<const float *>(grid_ptr),
+        reinterpret_cast<float *>(out_ptr),
+        B, C, H, W,
+        to_stream(stream_ptr)
+    );
+}
+
+static void py_kplanes_fuse_grad_cuda(
+    long pts_ptr, long grid_ptr, long gout_ptr,
+    long ggrid_ptr, long gpts_ptr,
+    long B, int C, int H, int W,
+    long stream_ptr
+) {
+    kplanes_fuse_grad_cuda(
+        reinterpret_cast<const float *>(pts_ptr),
+        reinterpret_cast<const float *>(grid_ptr),
+        reinterpret_cast<const float *>(gout_ptr),
+        reinterpret_cast<float *>(ggrid_ptr),
+        reinterpret_cast<float *>(gpts_ptr),
+        B, C, H, W,
+        to_stream(stream_ptr)
+    );
+}
+
 void register_core_ml_ops(py::module_ &m) {
+    m.def("kplanes_fuse_cuda", &py_kplanes_fuse_cuda,
+          "Fused NON-TILTED K-Planes interpolation (one level). pts_ptr: fp32 "
+          "[B,3]; grid_ptr: fp32 [3,H,W,C] channels-last; out_ptr: fp32 "
+          "[B,C], fully written.",
+          py::arg("pts_ptr"), py::arg("grid_ptr"), py::arg("out_ptr"),
+          py::arg("B"), py::arg("C"), py::arg("H"), py::arg("W"),
+          py::arg("stream_ptr"));
+
+    m.def("kplanes_fuse_grad_cuda", &py_kplanes_fuse_grad_cuda,
+          "Backward of kplanes_fuse. gout_ptr: fp32 [B,C]. ggrid/gpts are "
+          "accumulated into (pre-zero them).",
+          py::arg("pts_ptr"), py::arg("grid_ptr"),
+          py::arg("gout_ptr"), py::arg("ggrid_ptr"), py::arg("gpts_ptr"),
+          py::arg("B"), py::arg("C"), py::arg("H"), py::arg("W"),
+          py::arg("stream_ptr"));
+
     m.def("kplanes_tilted_fuse_cuda", &py_kplanes_tilted_fuse_cuda,
           "Fused TILTED K-Planes interpolation (one level). pts_ptr: fp32 "
           "[B,3]; r_ptr: fp32 [T,3,3]; grid_ptr: fp32 [3T,C,H,W]; out_ptr: "

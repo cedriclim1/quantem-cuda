@@ -134,6 +134,7 @@ pybind11_add_module(_core
     csrc/bindings/core.cpp
     csrc/bindings/core/ml.cpp
     csrc/cuda/core/tv_loss.cu
+    csrc/cuda/core/ml/kplanes.cu
     csrc/cuda/core/ml/kplanes_tilted.cu
 )
 target_include_directories(_core PRIVATE csrc)
