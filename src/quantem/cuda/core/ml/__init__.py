@@ -2,4 +2,5 @@
 
 from quantem.cuda.core.ml._ops import (
     kplanes_tilted_fuse as kplanes_tilted_fuse,
+    kplanes_tilted_tv_fuse as kplanes_tilted_tv_fuse,
 )
