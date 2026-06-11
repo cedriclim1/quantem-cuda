@@ -73,3 +73,31 @@ void kplanes_tilted_tv_fuse_grad_cuda(
     float h,
     cudaStream_t stream
 );
+
+/* Fused NON-TILTED K-Planes feature interpolation (one multiscale level):
+ * bilinearly sample the 3 planes at quantem's interpolate_ms_features
+ * coordinate pairs (p0,p1), (p0,p2), (p1,p2) (grid_sample
+ * align_corners=True / border semantics), Hadamard-multiply, write
+ * features. pts [B,3]; grid [3,H,W,C] CHANNELS-LAST; out [B,C] fully
+ * written. */
+void kplanes_fuse_cuda(
+    const float *d_pts,
+    const float *d_grid,
+    float       *d_out,
+    long B, int C, int H, int W,
+    cudaStream_t stream
+);
+
+/* Backward of the fused non-tilted interpolation. gout [B,C]; ggrid
+ * [3,H,W,C] (channels-last, like grid) and gpts [B,3] are accumulated
+ * into (caller pre-zeroes both). Coordinate gradients are zeroed where
+ * the border clip engaged, matching torch's grid_sampler. */
+void kplanes_fuse_grad_cuda(
+    const float *d_pts,
+    const float *d_grid,
+    const float *d_gout,
+    float       *d_ggrid,
+    float       *d_gpts,
+    long B, int C, int H, int W,
+    cudaStream_t stream
+);

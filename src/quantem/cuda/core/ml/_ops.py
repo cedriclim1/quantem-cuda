@@ -204,7 +204,113 @@ def _kpt_tv_backward(ctx, grad_out):
 _kplanes_tilted_tv_fuse.register_autograd(_kpt_tv_backward, setup_context=_kpt_tv_setup_context)
 
 
+# ── fused NON-TILTED K-Planes interpolation ───────────────────────────────
+
+
+@torch.library.custom_op("quantem_cuda::kplanes_fuse", mutates_args=())
+def _kplanes_fuse(pts: Tensor, plane: Tensor) -> Tensor:
+    p = pts.contiguous()
+    c, h, w = plane.shape[1:]
+    g = _channels_last(plane)
+    b = p.shape[0]
+    out = torch.empty((b, c), dtype=torch.float32, device=p.device)
+    stream = torch.cuda.current_stream(p.device).cuda_stream
+    with torch.cuda.device(p.device):
+        _core.kplanes_fuse_cuda(p.data_ptr(), g.data_ptr(), out.data_ptr(), b, c, h, w, stream)
+    return out
+
+
+@_kplanes_fuse.register_fake
+def _(pts: Tensor, plane: Tensor) -> Tensor:
+    return pts.new_empty((pts.shape[0], plane.shape[1]))
+
+
+@torch.library.custom_op("quantem_cuda::kplanes_fuse_bwd", mutates_args=())
+def _kplanes_fuse_bwd(pts: Tensor, plane: Tensor, grad_out: Tensor) -> list[Tensor]:
+    p = pts.contiguous()
+    c, h, w = plane.shape[1:]
+    g = _channels_last(plane)
+    b = p.shape[0]
+    gout = grad_out.detach().to(dtype=torch.float32, device=p.device).contiguous()
+    grad_pts = torch.zeros_like(p)  # accumulated across a point's channel chunks
+    grad_plane_cl = torch.zeros_like(g)
+    stream = torch.cuda.current_stream(p.device).cuda_stream
+    with torch.cuda.device(p.device):
+        _core.kplanes_fuse_grad_cuda(
+            p.data_ptr(),
+            g.data_ptr(),
+            gout.data_ptr(),
+            grad_plane_cl.data_ptr(),
+            grad_pts.data_ptr(),
+            b,
+            c,
+            h,
+            w,
+            stream,
+        )
+    # (3, H, W, C) → (3, C, H, W), matching the parameter layout
+    return [grad_pts, grad_plane_cl.permute(0, 3, 1, 2).contiguous()]
+
+
+@_kplanes_fuse_bwd.register_fake
+def _(pts: Tensor, plane: Tensor, grad_out: Tensor) -> list[Tensor]:
+    return [torch.empty_like(pts), torch.empty_like(plane)]
+
+
+def _kp_setup_context(ctx, inputs, output) -> None:
+    pts, plane = inputs
+    ctx.save_for_backward(pts, plane)
+
+
+def _kp_backward(ctx, grad_out):
+    pts, plane = ctx.saved_tensors
+    grad_pts, grad_plane = _kplanes_fuse_bwd(pts, plane, grad_out)
+    return grad_pts, grad_plane
+
+
+_kplanes_fuse.register_autograd(_kp_backward, setup_context=_kp_setup_context)
+
+
 # ── public wrappers ───────────────────────────────────────────────────────
+
+
+def kplanes_fuse(pts: Tensor, plane: Tensor) -> Tensor:
+    """Fused NON-TILTED K-Planes feature interpolation for one multiscale level.
+
+    For each point ``p``, bilinearly samples the three planes at quantem's
+    ``interpolate_ms_features`` coordinate pairs and Hadamard-multiplies
+    them — equivalent to (but much faster than)::
+
+        coords = torch.stack([pts[:, [0, 1]], pts[:, [0, 2]], pts[:, [1, 2]]]).view(3, -1, 1, 2)
+        feats = F.grid_sample(plane, coords, align_corners=True,
+                              mode="bilinear", padding_mode="border").reshape(3, C, -1)
+        out = (feats[0] * feats[1] * feats[2]).T
+
+    Differentiable w.r.t. both inputs (analytic CUDA backward, with torch's
+    border-clip zero-gradient convention for coordinates).
+
+    Args:
+        pts:   fp32 CUDA tensor ``[B, 3]``, coordinates in ``[-1, 1]``.
+        plane: fp32 CUDA tensor ``[3, C, H, W]``.
+
+    Returns:
+        fp32 tensor ``[B, C]``, differentiable.
+    """
+    if pts.ndim != 2 or pts.shape[-1] != 3:
+        raise ValueError(f"kplanes_fuse expects pts [B, 3], got {tuple(pts.shape)}")
+    if plane.ndim != 4 or plane.shape[0] != 3:
+        raise ValueError(f"kplanes_fuse expects plane [3, C, H, W], got {tuple(plane.shape)}")
+    for name, t in (("pts", pts), ("plane", plane)):
+        if t.dtype != torch.float32:
+            raise TypeError(f"kplanes_fuse is fp32-only ({name} is {t.dtype}).")
+        if not t.is_cuda:
+            raise ValueError(f"kplanes_fuse requires CUDA tensors ({name} on {t.device}).")
+    if plane.shape[1] * plane.shape[2] * plane.shape[3] >= 2**31:
+        raise ValueError(
+            "kplanes_fuse uses 32-bit per-plane offsets; "
+            f"C*H*W must be < 2^31, got plane {tuple(plane.shape)}"
+        )
+    return _kplanes_fuse(pts, plane)
 
 
 def kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor:
