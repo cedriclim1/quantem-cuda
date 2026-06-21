@@ -1,0 +1,66 @@
+[build-system]
+requires = ["scikit-build-core>=0.11", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "quantem-cuda"
+version = "0.1.0"
+description = "CUDA-accelerated kernels for the quantem electron-microscopy toolkit."
+keywords = ["EM", "TEM", "STEM", "4DSTEM", "tomography", "CUDA"]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+  "torch>=2.9",
+  "numpy>2",
+]
+
+[project.urls]
+Homepage = "https://github.com/electronmicroscopy/quantem-cuda"
+Repository = "https://github.com/electronmicroscopy/quantem-cuda"
+
+[dependency-groups]
+test = [
+    "pytest>=8.3.5",
+]
+dev = [
+    { include-group = "test" },
+    "ruff>=0.11.5",
+]
+
+[tool.uv.extra-build-dependencies]
+# Inject the pip CUDA 13 toolchain into this project's isolated build env so
+# `uv sync` / `uv pip install .` work without a system or conda CUDA install
+# (CMake probes site-packages for nvidia/cu13/bin/nvcc). Pin every component
+# to 13.0.x: the wheels do not pin their own transitive deps tightly, so a
+# loose `nvidia-cuda-nvcc` alone lets nvidia-nvvm/cuda-crt resolve to a newer
+# minor whose cicc emits PTX the older ptxas cannot assemble. 13.0 also
+# matches torch's cu130 builds. Downstream projects building quantem-cuda
+# from source need this same stanza in their own pyproject (uv applies the
+# *consumer's* settings, not ours).
+quantem-cuda = [
+    "nvidia-cuda-nvcc==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-cccl==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-runtime==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cuda-crt==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-nvvm==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+]
+
+[tool.scikit-build]
+cmake.version = ">=3.24"
+cmake.build-type = "Release"
+wheel.packages = ["src/quantem"]
+sdist.include = ["/csrc"]
+
+[tool.pytest.ini_options]
+addopts = ["--import-mode=importlib"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 99
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["I001"]
