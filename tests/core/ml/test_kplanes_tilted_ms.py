@@ -220,12 +220,8 @@ def test_ms_bf16_gout_matches_fp32_gout_of_same_values():
     upstream_bf16[:, ::5] = 0
     upstream_bf16[:, 1::7] = torch.tensor(5e-4, device="cuda", dtype=torch.bfloat16)
 
-    actual = _kplanes_tilted_fuse_ms_bwd(
-        pts, rotations, *grids, upstream_bf16, *GATES
-    )
-    expected = _kplanes_tilted_fuse_ms_bwd(
-        pts, rotations, *grids, upstream_bf16.float(), *GATES
-    )
+    actual = _kplanes_tilted_fuse_ms_bwd(pts, rotations, *grids, upstream_bf16, *GATES)
+    expected = _kplanes_tilted_fuse_ms_bwd(pts, rotations, *grids, upstream_bf16.float(), *GATES)
 
     for actual_grad, expected_grad in zip(actual, expected):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-6, atol=1e-7)
@@ -268,21 +264,13 @@ def test_ms_bf16_grid_and_gout_autocast_v5_smoke():
         actual_out = _multiscale(pts, rotations, *grids)
 
     assert actual_out.dtype == torch.bfloat16
-    torch.testing.assert_close(
-        actual_out, expected_out.to(torch.bfloat16), rtol=2e-4, atol=2e-6
-    )
+    torch.testing.assert_close(actual_out, expected_out.to(torch.bfloat16), rtol=2e-4, atol=2e-6)
 
     generator = torch.Generator(device="cuda").manual_seed(31)
-    upstream_bf16 = torch.empty_like(actual_out).uniform_(
-        -1.0, 1.0, generator=generator
-    )
+    upstream_bf16 = torch.empty_like(actual_out).uniform_(-1.0, 1.0, generator=generator)
     upstream_bf16[:, ::5] = 0
-    upstream_bf16[:, 1::7] = torch.tensor(
-        5e-4, device="cuda", dtype=torch.bfloat16
-    )
-    actual_grads = _kplanes_tilted_fuse_ms_bwd(
-        pts, rotations, *grids, upstream_bf16, *GATES
-    )
+    upstream_bf16[:, 1::7] = torch.tensor(5e-4, device="cuda", dtype=torch.bfloat16)
+    actual_grads = _kplanes_tilted_fuse_ms_bwd(pts, rotations, *grids, upstream_bf16, *GATES)
     expected_grads = _kplanes_tilted_fuse_ms_bwd(
         pts, rotations, *grids_fp32, upstream_bf16.float(), *GATES
     )
