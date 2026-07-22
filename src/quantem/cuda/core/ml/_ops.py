@@ -19,10 +19,24 @@ from quantem.cuda import _core
 
 
 def _channels_last(plane: Tensor) -> Tensor:
-    """(3T, C, H, W) → contiguous (3T, H, W, C) for the kernels. The grid is
-    tiny next to the per-point traffic, so this pass is noise — and it buys
-    contiguous per-cell channel reads inside the kernels."""
-    return plane.permute(0, 2, 3, 1).contiguous()
+    """Return a contiguous ``(3T, H, W, C)`` kernel view.
+
+    K-Planes parameters use logical NCHW shape with channels-last physical
+    storage, so their NHWC permutation is already contiguous. Arbitrary input
+    layouts retain the materializing fallback for correctness.
+    """
+    plane_cl = plane.permute(0, 2, 3, 1)
+    if plane_cl.is_contiguous():
+        return plane_cl
+    return plane_cl.contiguous()
+
+
+def _restore_plane_layout(grad_plane_cl: Tensor, plane: Tensor) -> Tensor:
+    """Return an NCHW gradient with the input plane's contiguous layout."""
+    grad_plane = grad_plane_cl.permute(0, 3, 1, 2)
+    if plane.permute(0, 2, 3, 1).is_contiguous():
+        return grad_plane
+    return grad_plane.contiguous()
 
 
 @torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse", mutates_args=())
@@ -79,7 +93,7 @@ def _kplanes_tilted_fuse_bwd(
             stream,
         )
     # (3T, H, W, C) → (3T, C, H, W), matching the parameter layout
-    return [grad_pts, grad_r, grad_plane_cl.permute(0, 3, 1, 2).contiguous()]
+    return [grad_pts, grad_r, _restore_plane_layout(grad_plane_cl, plane)]
 
 
 @_kplanes_tilted_fuse_bwd.register_fake
@@ -178,7 +192,7 @@ def _kplanes_tilted_tv_fuse_bwd(
             stream,
         )
     # (3T, H, W, C) → (3T, C, H, W), matching the parameter layout
-    return [grad_pts, grad_r, grad_plane_cl.permute(0, 3, 1, 2).contiguous()]
+    return [grad_pts, grad_r, _restore_plane_layout(grad_plane_cl, plane)]
 
 
 @_kplanes_tilted_tv_fuse_bwd.register_fake

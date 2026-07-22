@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 
 from quantem.cuda.core.ml import kplanes_tilted_fuse, kplanes_tilted_tv_fuse
+from quantem.cuda.core.ml._ops import _channels_last, _restore_plane_layout
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
@@ -184,6 +185,32 @@ def test_cpu_rejected():
     plane = torch.rand(6, 4, 9, 9)
     with pytest.raises(ValueError, match="CUDA"):
         kplanes_tilted_fuse(pts, rotations, plane)
+
+
+def test_channels_last_plane_and_gradient_views_avoid_copies():
+    plane = torch.rand(6, 4, 9, 11).contiguous(memory_format=torch.channels_last)
+
+    plane_cl = _channels_last(plane)
+    assert plane_cl.is_contiguous()
+    assert plane_cl.data_ptr() == plane.data_ptr()
+
+    grad_plane_cl = torch.zeros_like(plane_cl)
+    grad_plane = _restore_plane_layout(grad_plane_cl, plane)
+    assert grad_plane.is_contiguous(memory_format=torch.channels_last)
+    assert grad_plane.data_ptr() == grad_plane_cl.data_ptr()
+
+
+def test_row_major_plane_and_gradient_keep_copy_fallback():
+    plane = torch.rand(6, 4, 9, 11)
+
+    plane_cl = _channels_last(plane)
+    assert plane_cl.is_contiguous()
+    assert plane_cl.data_ptr() != plane.data_ptr()
+
+    grad_plane_cl = torch.zeros_like(plane_cl)
+    grad_plane = _restore_plane_layout(grad_plane_cl, plane)
+    assert grad_plane.is_contiguous()
+    assert grad_plane.data_ptr() != grad_plane_cl.data_ptr()
 
 
 # ── kplanes_tilted_tv_fuse ────────────────────────────────────────────────
