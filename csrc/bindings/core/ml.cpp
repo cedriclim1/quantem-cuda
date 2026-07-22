@@ -63,7 +63,7 @@ static void py_kplanes_tilted_fuse_ms_cuda(
     int C1, int H1, int W1,
     int C2, int H2, int W2,
     float scale0, float scale1, float scale2,
-    bool grid_is_bf16,
+    bool grid_is_bf16, bool output_is_bf16,
     long stream_ptr
 ) {
     kplanes_tilted_fuse_ms_cuda(
@@ -72,11 +72,12 @@ static void py_kplanes_tilted_fuse_ms_cuda(
         reinterpret_cast<const void *>(grid0_ptr),
         reinterpret_cast<const void *>(grid1_ptr),
         reinterpret_cast<const void *>(grid2_ptr),
-        reinterpret_cast<float *>(out_ptr),
+        reinterpret_cast<void *>(out_ptr),
         B, T,
         C0, H0, W0, C1, H1, W1, C2, H2, W2,
         scale0, scale1, scale2,
         grid_is_bf16,
+        output_is_bf16,
         to_stream(stream_ptr)
     );
 }
@@ -93,7 +94,7 @@ static void py_kplanes_tilted_fuse_ms_grad_cuda(
     int C2, int H2, int W2,
     long gout_row_stride,
     float scale0, float scale1, float scale2,
-    bool grid_is_bf16,
+    bool grid_is_bf16, bool gout_is_bf16,
     long stream_ptr
 ) {
     kplanes_tilted_fuse_ms_grad_cuda(
@@ -102,7 +103,7 @@ static void py_kplanes_tilted_fuse_ms_grad_cuda(
         reinterpret_cast<const void *>(grid0_ptr),
         reinterpret_cast<const void *>(grid1_ptr),
         reinterpret_cast<const void *>(grid2_ptr),
-        reinterpret_cast<const float *>(gout_ptr),
+        reinterpret_cast<const void *>(gout_ptr),
         reinterpret_cast<float *>(ggrid0_ptr),
         reinterpret_cast<float *>(ggrid1_ptr),
         reinterpret_cast<float *>(ggrid2_ptr),
@@ -113,6 +114,7 @@ static void py_kplanes_tilted_fuse_ms_grad_cuda(
         gout_row_stride,
         scale0, scale1, scale2,
         grid_is_bf16,
+        gout_is_bf16,
         to_stream(stream_ptr)
     );
 }
@@ -176,7 +178,7 @@ void register_core_ml_ops(py::module_ &m) {
           py::arg("stream_ptr"));
 
     m.def("kplanes_tilted_fuse_ms_cuda", &py_kplanes_tilted_fuse_ms_cuda,
-          "Three-level TILTED K-Planes forward. One launch writes fp32 "
+          "Three-level TILTED K-Planes forward. One launch writes fp32 or bf16 "
           "[B, T*(C0+C1+C2)] without concatenation.",
           py::arg("pts_ptr"), py::arg("r_ptr"),
           py::arg("grid0_ptr"), py::arg("grid1_ptr"), py::arg("grid2_ptr"),
@@ -185,10 +187,10 @@ void register_core_ml_ops(py::module_ &m) {
           py::arg("C1"), py::arg("H1"), py::arg("W1"),
           py::arg("C2"), py::arg("H2"), py::arg("W2"),
           py::arg("scale0"), py::arg("scale1"), py::arg("scale2"),
-          py::arg("grid_is_bf16"), py::arg("stream_ptr"));
+          py::arg("grid_is_bf16"), py::arg("output_is_bf16"), py::arg("stream_ptr"));
 
     m.def("kplanes_tilted_fuse_ms_grad_cuda", &py_kplanes_tilted_fuse_ms_grad_cuda,
-          "Backward of the three-level op. Reads an inner-contiguous gout "
+          "Backward of the three-level op. Reads an fp32 or bf16 inner-contiguous gout "
           "using its row stride and level column offsets.",
           py::arg("pts_ptr"), py::arg("r_ptr"),
           py::arg("grid0_ptr"), py::arg("grid1_ptr"), py::arg("grid2_ptr"),
@@ -201,7 +203,7 @@ void register_core_ml_ops(py::module_ &m) {
           py::arg("C2"), py::arg("H2"), py::arg("W2"),
           py::arg("gout_row_stride"),
           py::arg("scale0"), py::arg("scale1"), py::arg("scale2"),
-          py::arg("grid_is_bf16"), py::arg("stream_ptr"));
+          py::arg("grid_is_bf16"), py::arg("gout_is_bf16"), py::arg("stream_ptr"));
 
     m.def("kplanes_tilted_tv_fuse_cuda", &py_kplanes_tilted_tv_fuse_cuda,
           "TV-specialized fused TILTED K-Planes forward. pts_ptr: fp32 [B,3]; "

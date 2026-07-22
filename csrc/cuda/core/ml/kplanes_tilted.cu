@@ -41,14 +41,14 @@ struct ThresholdBallot {
     }
 };
 
-template <typename GridT, bool MultiLevel>
+template <typename GridT, typename OutT, bool MultiLevel>
 __global__ void kplanes_tilted_fwd_core(
     const float *__restrict__ pts,
     const float *__restrict__ R,
     const GridT *__restrict__ grid0,
     const GridT *__restrict__ grid1,
     const GridT *__restrict__ grid2,
-    float *__restrict__ out,
+    OutT *__restrict__ out,
     long B, int T,
     int C0, int H0, int W0,
     int C1, int H1, int W1,
@@ -102,14 +102,14 @@ __global__ void kplanes_tilted_fwd_core(
         sample_forward(grid, t, c, C, H, W, rx, ry, rz) * scale;
 }
 
-template <typename GridT, class EarlyOut, bool MultiLevel>
+template <typename GridT, typename GoutT, class EarlyOut, bool MultiLevel>
 __global__ void kplanes_tilted_bwd_core(
     const float *__restrict__ pts,
     const float *__restrict__ R,
     const GridT *__restrict__ grid0,
     const GridT *__restrict__ grid1,
     const GridT *__restrict__ grid2,
-    const float *__restrict__ gout,
+    const GoutT *__restrict__ gout,
     float *__restrict__ ggrid0,
     float *__restrict__ ggrid1,
     float *__restrict__ ggrid2,
@@ -176,13 +176,15 @@ __global__ void kplanes_tilted_bwd_core(
         float go = 0.f;
         if constexpr (EarlyOut::enabled) {
             go = segment.active
-                ? gout[b * row_stride + gout_col_offset + t * C + segment.channel] * scale
+                ? gout_value(
+                      gout, b * row_stride + gout_col_offset + t * C + segment.channel) * scale
                 : 0.f;
             keep = EarlyOut::keep(segment.mask, go, zero_tau);
         }
         if (segment.active && keep) {
             if constexpr (!EarlyOut::enabled) {
-                go = gout[b * row_stride + gout_col_offset + t * C + segment.channel] * scale;
+                go = gout_value(
+                         gout, b * row_stride + gout_col_offset + t * C + segment.channel) * scale;
             }
             sample_backward(
                 grid, ggrid, t, segment.channel, C, H, W, rx, ry, rz, go, dgx, dgy);
@@ -197,7 +199,8 @@ __global__ void kplanes_tilted_bwd_core(
     } else {
         // V5 scopes dense values tightly, then recomputes leader-only values.
         const float go = segment.active
-            ? gout[b * row_stride + gout_col_offset + t * C + segment.channel] * scale
+            ? gout_value(
+                  gout, b * row_stride + gout_col_offset + t * C + segment.channel) * scale
             : 0.f;
         if (!EarlyOut::keep(segment.mask, go, zero_tau)) goto threshold_segment_reduction;
         if (segment.active) {
@@ -390,39 +393,41 @@ inline const KplanesTiltedBwdConfig &kplanes_tilted_bwd_config() {
     return config;
 }
 
-template <typename GridT, bool MultiLevel>
+template <typename GridT, typename OutT, bool MultiLevel>
 inline void launch_fwd(
     dim3 blocks, size_t shmem, cudaStream_t stream,
     const float *pts, const float *R,
     const void *grid0, const void *grid1, const void *grid2,
-    float *out, long B, int T,
+    void *out, long B, int T,
     int C0, int H0, int W0, int C1, int H1, int W1, int C2, int H2, int W2,
     float scale0, float scale1, float scale2
 ) {
-    kplanes_tilted_fwd_core<GridT, MultiLevel><<<blocks, kThreads, shmem, stream>>>(
+    kplanes_tilted_fwd_core<GridT, OutT, MultiLevel><<<blocks, kThreads, shmem, stream>>>(
         pts, R, static_cast<const GridT *>(grid0), static_cast<const GridT *>(grid1),
-        static_cast<const GridT *>(grid2), out, B, T,
+        static_cast<const GridT *>(grid2), static_cast<OutT *>(out), B, T,
         C0, H0, W0, C1, H1, W1, C2, H2, W2, scale0, scale1, scale2);
 }
 
-template <typename GridT, class EarlyOut, bool MultiLevel>
+template <typename GridT, typename GoutT, class EarlyOut, bool MultiLevel>
 inline void launch_bwd(
     dim3 blocks, size_t shmem, cudaStream_t stream,
     const float *pts, const float *R,
-    const void *grid0, const void *grid1, const void *grid2, const float *gout,
+    const void *grid0, const void *grid1, const void *grid2, const void *gout,
     float *ggrid0, float *ggrid1, float *ggrid2, float *gR, float *gpts,
     long B, int T,
     int C0, int H0, int W0, int C1, int H1, int W1, int C2, int H2, int W2,
     long gout_row_stride, float scale0, float scale1, float scale2, float zero_tau
 ) {
-    kplanes_tilted_bwd_core<GridT, EarlyOut, MultiLevel><<<blocks, kThreads, shmem, stream>>>(
+    kplanes_tilted_bwd_core<GridT, GoutT, EarlyOut, MultiLevel><<<
+        blocks, kThreads, shmem, stream>>>(
         pts, R, static_cast<const GridT *>(grid0), static_cast<const GridT *>(grid1),
-        static_cast<const GridT *>(grid2), gout, ggrid0, ggrid1, ggrid2, gR, gpts, B, T,
+        static_cast<const GridT *>(grid2), static_cast<const GoutT *>(gout),
+        ggrid0, ggrid1, ggrid2, gR, gpts, B, T,
         C0, H0, W0, C1, H1, W1, C2, H2, W2, gout_row_stride,
         scale0, scale1, scale2, zero_tau);
 }
 
-template <bool MultiLevel>
+template <bool MultiLevel, typename GoutT>
 struct BwdLaunch {
     dim3 blocks;
     size_t shmem;
@@ -432,7 +437,7 @@ struct BwdLaunch {
     const void *grid0;
     const void *grid1;
     const void *grid2;
-    const float *gout;
+    const void *gout;
     float *ggrid0;
     float *ggrid1;
     float *ggrid2;
@@ -446,7 +451,7 @@ struct BwdLaunch {
 
     template <typename GridT, class EarlyOut>
     void operator()() const {
-        launch_bwd<GridT, EarlyOut, MultiLevel>(
+        launch_bwd<GridT, GoutT, EarlyOut, MultiLevel>(
             blocks, shmem, stream, pts, R, grid0, grid1, grid2, gout,
             ggrid0, ggrid1, ggrid2, gR, gpts, B, T,
             C0, H0, W0, C1, H1, W1, C2, H2, W2, gout_row_stride,
@@ -498,11 +503,11 @@ void kplanes_tilted_fuse_cuda(
     const dim3 blocks(n_blocks(B * (long)(T * C)), 1);
     const size_t shmem = (size_t)T * 9 * sizeof(float);
     if (grid_is_bf16) {
-        launch_fwd<__nv_bfloat16, false>(
+        launch_fwd<__nv_bfloat16, float, false>(
             blocks, shmem, stream, d_pts, d_R, d_grid, d_grid, d_grid, d_out, B, T,
             C, H, W, 0, 0, 0, 0, 0, 0, 1.f, 1.f, 1.f);
     } else {
-        launch_fwd<float, false>(
+        launch_fwd<float, float, false>(
             blocks, shmem, stream, d_pts, d_R, d_grid, d_grid, d_grid, d_out, B, T,
             C, H, W, 0, 0, 0, 0, 0, 0, 1.f, 1.f, 1.f);
     }
@@ -518,7 +523,7 @@ void kplanes_tilted_fuse_grad_cuda(
     const size_t shmem = (size_t)T * 18 * sizeof(float);
     const KplanesTiltedBwdConfig &config = kplanes_tilted_bwd_config();
     validate_bwd_storage(grid_is_bf16, config.variant);
-    const BwdLaunch<false> launch{
+    const BwdLaunch<false, float> launch{
         dim3(n_blocks(n_warps(B * (long)T, C) * 32), 1), shmem, stream,
         d_pts, d_R, d_grid, d_grid, d_grid, d_gout,
         d_ggrid, d_ggrid, d_ggrid, d_gR, d_gpts, B, T,
@@ -530,10 +535,11 @@ void kplanes_tilted_fuse_grad_cuda(
 
 void kplanes_tilted_fuse_ms_cuda(
     const float *d_pts, const float *d_R,
-    const void *d_grid0, const void *d_grid1, const void *d_grid2, float *d_out,
+    const void *d_grid0, const void *d_grid1, const void *d_grid2, void *d_out,
     long B, int T,
     int C0, int H0, int W0, int C1, int H1, int W1, int C2, int H2, int W2,
-    float scale0, float scale1, float scale2, bool grid_is_bf16, cudaStream_t stream
+    float scale0, float scale1, float scale2,
+    bool grid_is_bf16, bool output_is_bf16, cudaStream_t stream
 ) {
     if (B == 0) return;
     int blocks = n_blocks(B * (long)(T * C0));
@@ -541,12 +547,20 @@ void kplanes_tilted_fuse_ms_cuda(
     blocks = max(blocks, n_blocks(B * (long)(T * C2)));
     const dim3 grid_dim(blocks, 3);
     const size_t shmem = (size_t)T * 9 * sizeof(float);
-    if (grid_is_bf16) {
-        launch_fwd<__nv_bfloat16, true>(
+    if (grid_is_bf16 && output_is_bf16) {
+        launch_fwd<__nv_bfloat16, __nv_bfloat16, true>(
+            grid_dim, shmem, stream, d_pts, d_R, d_grid0, d_grid1, d_grid2, d_out, B, T,
+            C0, H0, W0, C1, H1, W1, C2, H2, W2, scale0, scale1, scale2);
+    } else if (grid_is_bf16) {
+        launch_fwd<__nv_bfloat16, float, true>(
+            grid_dim, shmem, stream, d_pts, d_R, d_grid0, d_grid1, d_grid2, d_out, B, T,
+            C0, H0, W0, C1, H1, W1, C2, H2, W2, scale0, scale1, scale2);
+    } else if (output_is_bf16) {
+        launch_fwd<float, __nv_bfloat16, true>(
             grid_dim, shmem, stream, d_pts, d_R, d_grid0, d_grid1, d_grid2, d_out, B, T,
             C0, H0, W0, C1, H1, W1, C2, H2, W2, scale0, scale1, scale2);
     } else {
-        launch_fwd<float, true>(
+        launch_fwd<float, float, true>(
             grid_dim, shmem, stream, d_pts, d_R, d_grid0, d_grid1, d_grid2, d_out, B, T,
             C0, H0, W0, C1, H1, W1, C2, H2, W2, scale0, scale1, scale2);
     }
@@ -555,12 +569,12 @@ void kplanes_tilted_fuse_ms_cuda(
 
 void kplanes_tilted_fuse_ms_grad_cuda(
     const float *d_pts, const float *d_R,
-    const void *d_grid0, const void *d_grid1, const void *d_grid2, const float *d_gout,
+    const void *d_grid0, const void *d_grid1, const void *d_grid2, const void *d_gout,
     float *d_ggrid0, float *d_ggrid1, float *d_ggrid2, float *d_gR, float *d_gpts,
     long B, int T,
     int C0, int H0, int W0, int C1, int H1, int W1, int C2, int H2, int W2,
     long gout_row_stride, float scale0, float scale1, float scale2,
-    bool grid_is_bf16, cudaStream_t stream
+    bool grid_is_bf16, bool gout_is_bf16, cudaStream_t stream
 ) {
     if (B == 0) return;
     int blocks = n_blocks(n_warps(B * (long)T, C0) * 32);
@@ -570,12 +584,21 @@ void kplanes_tilted_fuse_ms_grad_cuda(
     const size_t shmem = (size_t)T * 18 * sizeof(float);
     const KplanesTiltedBwdConfig &config = kplanes_tilted_bwd_config();
     validate_bwd_storage(grid_is_bf16, config.variant);
-    const BwdLaunch<true> launch{
-        grid_dim, shmem, stream, d_pts, d_R, d_grid0, d_grid1, d_grid2, d_gout,
-        d_ggrid0, d_ggrid1, d_ggrid2, d_gR, d_gpts, B, T,
-        C0, H0, W0, C1, H1, W1, C2, H2, W2, gout_row_stride,
-        scale0, scale1, scale2, config.zero_tau};
-    dispatch_bwd(grid_is_bf16, config.variant, launch);
+    if (gout_is_bf16) {
+        const BwdLaunch<true, __nv_bfloat16> launch{
+            grid_dim, shmem, stream, d_pts, d_R, d_grid0, d_grid1, d_grid2, d_gout,
+            d_ggrid0, d_ggrid1, d_ggrid2, d_gR, d_gpts, B, T,
+            C0, H0, W0, C1, H1, W1, C2, H2, W2, gout_row_stride,
+            scale0, scale1, scale2, config.zero_tau};
+        dispatch_bwd(grid_is_bf16, config.variant, launch);
+    } else {
+        const BwdLaunch<true, float> launch{
+            grid_dim, shmem, stream, d_pts, d_R, d_grid0, d_grid1, d_grid2, d_gout,
+            d_ggrid0, d_ggrid1, d_ggrid2, d_gR, d_gpts, B, T,
+            C0, H0, W0, C1, H1, W1, C2, H2, W2, gout_row_stride,
+            scale0, scale1, scale2, config.zero_tau};
+        dispatch_bwd(grid_is_bf16, config.variant, launch);
+    }
     CUDA_CHECK_KERNEL();
 }
 

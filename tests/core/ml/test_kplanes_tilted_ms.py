@@ -122,6 +122,48 @@ def test_ms_forward_matches_concatenated_levels():
 
 
 @requires_cuda
+def test_ms_bf16_autocast_output_matches_fp32_output_cast(monkeypatch):
+    pts, rotations, grids = _inputs(seed=4)
+
+    monkeypatch.setenv("QUANTEM_KPLANES_MS_BF16_OUT", "0")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        expected_fp32 = _multiscale(pts, rotations, *grids)
+    assert expected_fp32.dtype == torch.float32
+
+    monkeypatch.setenv("QUANTEM_KPLANES_MS_BF16_OUT", "1")
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        actual = _multiscale(pts, rotations, *grids)
+
+    assert actual.dtype == torch.bfloat16
+    # Both paths round the same fp32 epilogue value once to bf16: the new path
+    # does so at the CUDA store, while the reference uses an explicit cast.
+    assert torch.equal(actual, expected_fp32.to(torch.bfloat16))
+
+
+@requires_cuda
+def test_ms_non_bf16_autocast_keeps_fp32_output(monkeypatch):
+    pts, rotations, grids = _inputs(seed=4)
+    monkeypatch.setenv("QUANTEM_KPLANES_MS_BF16_OUT", "1")
+
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        actual = _multiscale(pts, rotations, *grids)
+
+    assert actual.dtype == torch.float32
+
+
+@requires_cuda
+def test_ms_autocast_off_is_byte_identical_with_kill_switch(monkeypatch):
+    pts, rotations, grids = _inputs(seed=4)
+    monkeypatch.setenv("QUANTEM_KPLANES_MS_BF16_OUT", "1")
+    enabled = _multiscale(pts, rotations, *grids)
+    monkeypatch.setenv("QUANTEM_KPLANES_MS_BF16_OUT", "0")
+    disabled = _multiscale(pts, rotations, *grids)
+
+    assert enabled.dtype == disabled.dtype == torch.float32
+    assert torch.equal(enabled.view(torch.uint8), disabled.view(torch.uint8))
+
+
+@requires_cuda
 def test_ms_grads_match_fp64_anchored_single_levels():
     """Account for the atomic reduction's documented run-to-run envelope (ISS-4)."""
     pts, rotations, grids = _inputs(seed=5)
@@ -165,6 +207,49 @@ def test_ms_backward_reads_strided_upstream_without_packing():
     expected = torch.autograd.grad((_single_cat(*inputs) * upstream).sum(), inputs)
     for expected_grad, actual_grad in zip(expected, actual):
         torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-4, atol=3e-6)
+
+
+@requires_cuda
+def test_ms_bf16_gout_matches_fp32_gout_of_same_values():
+    pts, rotations, grids = _inputs(seed=8)
+    width = rotations.shape[0] * sum(grid.shape[1] for grid in grids)
+    generator = torch.Generator(device="cuda").manual_seed(29)
+    upstream_bf16 = torch.empty(
+        (pts.shape[0], width), device="cuda", dtype=torch.bfloat16
+    ).uniform_(-1.0, 1.0, generator=generator)
+    upstream_bf16[:, ::5] = 0
+    upstream_bf16[:, 1::7] = torch.tensor(5e-4, device="cuda", dtype=torch.bfloat16)
+
+    actual = _kplanes_tilted_fuse_ms_bwd(
+        pts, rotations, *grids, upstream_bf16, *GATES
+    )
+    expected = _kplanes_tilted_fuse_ms_bwd(
+        pts, rotations, *grids, upstream_bf16.float(), *GATES
+    )
+
+    for actual_grad, expected_grad in zip(actual, expected):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=1e-6, atol=1e-7)
+
+
+@requires_cuda
+def test_ms_v5_bf16_gout_composes_with_threshold_ballot():
+    env = os.environ.copy()
+    env["QUANTEM_KPLANES_BWD_VARIANT"] = "5"
+    env["QUANTEM_KPLANES_BWD_ZERO_TAU"] = "1e-3"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            f"{__file__}::test_ms_bf16_gout_matches_fp32_gout_of_same_values",
+            "-q",
+        ],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @requires_cuda

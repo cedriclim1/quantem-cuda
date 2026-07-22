@@ -56,6 +56,12 @@ __device__ __forceinline__ float grid_value(const __nv_bfloat16 *p, int off) {
     return __bfloat162float(p[off]);
 }
 
+__device__ __forceinline__ float gout_value(const float *p, long off) { return p[off]; }
+
+__device__ __forceinline__ float gout_value(const __nv_bfloat16 *p, long off) {
+    return __bfloat162float(p[off]);
+}
+
 __device__ __forceinline__ void stage_rotations(
     const float *R, float *sR, float *sgR, int T
 ) {

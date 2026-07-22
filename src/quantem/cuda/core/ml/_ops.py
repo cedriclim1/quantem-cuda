@@ -41,6 +41,15 @@ def _restore_plane_layout(grad_plane_cl: Tensor, plane: Tensor) -> Tensor:
     return grad_plane.contiguous()
 
 
+def _kplanes_ms_bf16_output_enabled() -> bool:
+    """Select direct bf16 feature stores for CUDA bf16 autocast."""
+    return (
+        os.environ.get("QUANTEM_KPLANES_MS_BF16_OUT", "1") != "0"
+        and torch.is_autocast_enabled("cuda")
+        and torch.get_autocast_dtype("cuda") == torch.bfloat16
+    )
+
+
 @torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse", mutates_args=())
 def _kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor:
     p = pts.contiguous()
@@ -147,6 +156,7 @@ def _kplanes_tilted_fuse_ms(
     scale0: float,
     scale1: float,
     scale2: float,
+    output_is_bf16: bool,
 ) -> Tensor:
     p = pts.contiguous()
     r = rotations.contiguous()
@@ -156,7 +166,8 @@ def _kplanes_tilted_fuse_ms(
     b = p.shape[0]
     t = r.shape[0]
     out_width = t * sum(plane.shape[1] for plane in planes)
-    out = torch.empty((b, out_width), dtype=torch.float32, device=p.device)
+    out_dtype = torch.bfloat16 if output_is_bf16 else torch.float32
+    out = torch.empty((b, out_width), dtype=out_dtype, device=p.device)
     stream = torch.cuda.current_stream(p.device).cuda_stream
     with torch.cuda.device(p.device):
         _core.kplanes_tilted_fuse_ms_cuda(
@@ -171,6 +182,7 @@ def _kplanes_tilted_fuse_ms(
             scale1,
             scale2,
             grids[0].dtype == torch.bfloat16,
+            output_is_bf16,
             stream,
         )
     return out
@@ -186,10 +198,12 @@ def _(
     scale0: float,
     scale1: float,
     scale2: float,
+    output_is_bf16: bool,
 ) -> Tensor:
     del scale0, scale1, scale2
     width = rotations.shape[0] * (plane0.shape[1] + plane1.shape[1] + plane2.shape[1])
-    return pts.new_empty((pts.shape[0], width))
+    dtype = torch.bfloat16 if output_is_bf16 else torch.float32
+    return pts.new_empty((pts.shape[0], width), dtype=dtype)
 
 
 @torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse_ms_bwd", mutates_args=())
@@ -211,7 +225,9 @@ def _kplanes_tilted_fuse_ms_bwd(
     dims = tuple(dim for plane in planes for dim in plane.shape[1:])
     b = p.shape[0]
     t = r.shape[0]
-    gout = grad_out.detach().to(dtype=torch.float32, device=p.device)
+    gout = grad_out.detach().to(device=p.device)
+    if gout.dtype not in (torch.float32, torch.bfloat16):
+        gout = gout.float()
     # Slices produced by a concatenated consumer have stride
     # (total_feature_width, 1). Preserve that view and pass its row stride;
     # only exotic non-unit inner strides need a materializing fallback.
@@ -238,6 +254,7 @@ def _kplanes_tilted_fuse_ms_bwd(
             scale1,
             scale2,
             grids[0].dtype == torch.bfloat16,
+            gout.dtype == torch.bfloat16,
             stream,
         )
     restored = tuple(
@@ -270,7 +287,8 @@ def _(
 
 def _kpt_ms_setup_context(ctx, inputs, output) -> None:
     del output
-    pts, rotations, plane0, plane1, plane2, scale0, scale1, scale2 = inputs
+    pts, rotations, plane0, plane1, plane2, scale0, scale1, scale2, output_is_bf16 = inputs
+    del output_is_bf16
     ctx.save_for_backward(pts, rotations, plane0, plane1, plane2)
     ctx.scales = (scale0, scale1, scale2)
 
@@ -280,7 +298,7 @@ def _kpt_ms_backward(ctx, grad_out):
     grads = _kplanes_tilted_fuse_ms_bwd(
         pts, rotations, plane0, plane1, plane2, grad_out, *ctx.scales
     )
-    return *grads, None, None, None
+    return *grads, None, None, None, None
 
 
 _kplanes_tilted_fuse_ms.register_autograd(_kpt_ms_backward, setup_context=_kpt_ms_setup_context)
@@ -469,7 +487,8 @@ def kplanes_tilted_fuse_ms(
     ``[B, T*(C_0+C_1+C_2)]`` with scale-major slices, matching
     ``torch.cat([kplanes_tilted_fuse(..., plane_l)], dim=-1)``. The three
     scalar gates are applied in the CUDA forward epilogue and at the backward
-    upstream-gradient load.
+    upstream-gradient load. Under CUDA bf16 autocast, the kernel stores bf16
+    features directly unless ``QUANTEM_KPLANES_MS_BF16_OUT=0``.
     """
     name = "kplanes_tilted_fuse_ms"
     if pts.ndim != 2 or pts.shape[-1] != 3:
@@ -518,6 +537,7 @@ def kplanes_tilted_fuse_ms(
         float(scale0),
         float(scale1),
         float(scale2),
+        _kplanes_ms_bf16_output_enabled(),
     )
 
 
