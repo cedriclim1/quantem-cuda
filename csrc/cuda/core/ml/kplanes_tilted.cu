@@ -106,10 +106,53 @@ __device__ __forceinline__ void rotate(
     rz = Rt[6] * px + Rt[7] * py + Rt[8] * pz;
 }
 
+__device__ __forceinline__ float grid_value(const float *p, int off) { return p[off]; }
+
+__device__ __forceinline__ float grid_value(const __nv_bfloat16 *p, int off) {
+    return __bfloat162float(p[off]);
+}
+
+template <typename GridT>
+__device__ __forceinline__ void kplanes_tilted_fwd_body(
+    const float *__restrict__ pts,
+    const float *__restrict__ sR,
+    const GridT *__restrict__ grid, // [3T, H, W, C] channels-last
+    float *__restrict__ out,
+    long tid, int T, int C, int H, int W,
+    long out_row_stride, long out_col_offset,
+    float scale
+) {
+    const long b = tid / (T * C);
+    const int rem = (int)(tid - b * (T * C));
+    const int t = rem / C;
+    const int c = rem - t * C;
+
+    const float px = pts[3 * b], py = pts[3 * b + 1], pz = pts[3 * b + 2];
+    float rx, ry, rz;
+    rotate(sR + t * 9, px, py, pz, rx, ry, rz);
+
+    const long planeHWC = (long)H * W * C;
+    const float gxs[3] = {rx, rz, ry};
+    const float gys[3] = {ry, rx, rz};
+
+    float prod = 1.f;
+#pragma unroll
+    for (int p = 0; p < 3; ++p) {
+        const Tap tp = make_tap(gxs[p], gys[p], H, W, C);
+        const GridT *pc = grid + (long)(t * 3 + p) * planeHWC + c;
+        prod *= tp.w[0] * grid_value(pc, tp.off[0])
+              + tp.w[1] * grid_value(pc, tp.off[1])
+              + tp.w[2] * grid_value(pc, tp.off[2])
+              + tp.w[3] * grid_value(pc, tp.off[3]);
+    }
+    out[b * out_row_stride + out_col_offset + rem] = prod * scale;
+}
+
+template <typename GridT>
 __global__ void kplanes_tilted_fwd_kernel(
     const float *__restrict__ pts,
     const float *__restrict__ R,
-    const float *__restrict__ grid, // [3T, H, W, C] channels-last
+    const GridT *__restrict__ grid,
     float *__restrict__ out,
     long B, int T, int C, int H, int W
 ) {
@@ -119,72 +162,11 @@ __global__ void kplanes_tilted_fwd_kernel(
 
     const long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= B * (long)(T * C)) return;
-    const long b = tid / (T * C);
-    const int rem = (int)(tid - b * (T * C));
-    const int t = rem / C;
-    const int c = rem - t * C;
-
-    const float px = pts[3 * b], py = pts[3 * b + 1], pz = pts[3 * b + 2];
-    float rx, ry, rz;
-    rotate(sR + t * 9, px, py, pz, rx, ry, rz);
-
-    const long planeHWC = (long)H * W * C;
-    const float gxs[3] = {rx, rz, ry};
-    const float gys[3] = {ry, rx, rz};
-
-    float prod = 1.f;
-#pragma unroll
-    for (int p = 0; p < 3; ++p) {
-        const Tap tp = make_tap(gxs[p], gys[p], H, W, C);
-        const float *pc = grid + (long)(t * 3 + p) * planeHWC + c;
-        prod *= tp.w[0] * pc[tp.off[0]] + tp.w[1] * pc[tp.off[1]] + tp.w[2] * pc[tp.off[2]]
-              + tp.w[3] * pc[tp.off[3]];
-    }
-    out[tid] = prod; // out[b, t*C + c] — tid is exactly that flat index
+    kplanes_tilted_fwd_body(
+        pts, sR, grid, out, tid, T, C, H, W, T * (long)C, 0, 1.f);
 }
 
-// V4's bf16 storage experiment needs a matching forward read path.  Keep the
-// original fp32 kernel above untouched so variant 0 has identical codegen.
-__global__ void kplanes_tilted_fwd_bf16_kernel(
-    const float *__restrict__ pts,
-    const float *__restrict__ R,
-    const __nv_bfloat16 *__restrict__ grid, // [3T, H, W, C] channels-last
-    float *__restrict__ out,
-    long B, int T, int C, int H, int W
-) {
-    extern __shared__ float sR[]; // [T*9]
-    for (int i = threadIdx.x; i < T * 9; i += blockDim.x) sR[i] = R[i];
-    __syncthreads();
-
-    const long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= B * (long)(T * C)) return;
-    const long b = tid / (T * C);
-    const int rem = (int)(tid - b * (T * C));
-    const int t = rem / C;
-    const int c = rem - t * C;
-
-    const float px = pts[3 * b], py = pts[3 * b + 1], pz = pts[3 * b + 2];
-    float rx, ry, rz;
-    rotate(sR + t * 9, px, py, pz, rx, ry, rz);
-
-    const long planeHWC = (long)H * W * C;
-    const float gxs[3] = {rx, rz, ry};
-    const float gys[3] = {ry, rx, rz};
-
-    float prod = 1.f;
-#pragma unroll
-    for (int p = 0; p < 3; ++p) {
-        const Tap tp = make_tap(gxs[p], gys[p], H, W, C);
-        const __nv_bfloat16 *pc = grid + (long)(t * 3 + p) * planeHWC + c;
-        prod *= tp.w[0] * __bfloat162float(pc[tp.off[0]])
-              + tp.w[1] * __bfloat162float(pc[tp.off[1]])
-              + tp.w[2] * __bfloat162float(pc[tp.off[2]])
-              + tp.w[3] * __bfloat162float(pc[tp.off[3]]);
-    }
-    out[tid] = prod;
-}
-
-__global__ void kplanes_tilted_bwd_kernel(
+__device__ __forceinline__ void kplanes_tilted_bwd_body(
     const float *__restrict__ pts,
     const float *__restrict__ R,
     const float *__restrict__ grid, // [3T, H, W, C] channels-last
@@ -192,9 +174,12 @@ __global__ void kplanes_tilted_bwd_kernel(
     float *__restrict__ ggrid,      // [3T, H, W, C], pre-zeroed
     float *__restrict__ gR,         // [T, 3, 3], pre-zeroed
     float *__restrict__ gpts,       // [B, 3], pre-zeroed
-    long B, int T, int C, int H, int W
+    long B, int T, int C, int H, int W,
+    long gout_row_stride, long gout_col_offset,
+    float scale,
+    long block_index,
+    float *smem
 ) {
-    extern __shared__ float smem[]; // [T*9] R copy | [T*9] gR partials
     float *sR = smem;
     float *sgR = smem + T * 9;
     for (int i = threadIdx.x; i < T * 9; i += blockDim.x) {
@@ -207,7 +192,7 @@ __global__ void kplanes_tilted_bwd_kernel(
     // (one 32-channel chunk of them when C > 32). Segments never straddle
     // warps; lanes past the last whole segment idle but join the shuffles.
     const int lane = threadIdx.x & 31;
-    const long warp_id = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const long warp_id = (block_index * blockDim.x + threadIdx.x) >> 5;
     const int CW = C < 32 ? C : 32; // channels per segment
     long group;                     // index over B*T (point, rotation) pairs
     int c, lis;                     // channel, lane-in-segment
@@ -247,7 +232,8 @@ __global__ void kplanes_tilted_bwd_kernel(
     if (active) {
         Tap tap[3];
         float s[3], dsdix[3], dsdiy[3];
-        const float go = gout[group * C + c]; // gout[b, t*C + c]
+        const float go =
+            gout[b * gout_row_stride + gout_col_offset + t * C + c] * scale;
 #pragma unroll
         for (int p = 0; p < 3; ++p) {
             tap[p] = make_tap(gxs[p], gys[p], H, W, C);
@@ -326,17 +312,11 @@ __global__ void kplanes_tilted_bwd_kernel(
     }
 }
 
-__device__ __forceinline__ float grid_value(const float *p, int off) { return p[off]; }
-
-__device__ __forceinline__ float grid_value(const __nv_bfloat16 *p, int off) {
-    return __bfloat162float(p[off]);
-}
-
 // V3: baseline mapping and arithmetic with one segment-scoped zero-gout vote.
 // V4 instantiates the same kernel with bf16 grid storage; all arithmetic and
 // every gradient destination remain fp32.
 template <typename GridT>
-__global__ void kplanes_tilted_bwd_earlyout_kernel(
+__device__ __forceinline__ void kplanes_tilted_bwd_earlyout_body(
     const float *__restrict__ pts,
     const float *__restrict__ R,
     const GridT *__restrict__ grid, // [3T, H, W, C] channels-last
@@ -344,9 +324,12 @@ __global__ void kplanes_tilted_bwd_earlyout_kernel(
     float *__restrict__ ggrid,      // [3T, H, W, C], pre-zeroed fp32
     float *__restrict__ gR,         // [T, 3, 3], pre-zeroed
     float *__restrict__ gpts,       // [B, 3], pre-zeroed
-    long B, int T, int C, int H, int W
+    long B, int T, int C, int H, int W,
+    long gout_row_stride, long gout_col_offset,
+    float scale,
+    long block_index,
+    float *smem
 ) {
-    extern __shared__ float smem[]; // [T*9] R copy | [T*9] gR partials
     float *sR = smem;
     float *sgR = smem + T * 9;
     for (int i = threadIdx.x; i < T * 9; i += blockDim.x) {
@@ -356,7 +339,7 @@ __global__ void kplanes_tilted_bwd_earlyout_kernel(
     __syncthreads();
 
     const int lane = threadIdx.x & 31;
-    const long warp_id = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const long warp_id = (block_index * blockDim.x + threadIdx.x) >> 5;
     const int CW = C < 32 ? C : 32;
     long group;
     int c, lis;
@@ -405,7 +388,9 @@ __global__ void kplanes_tilted_bwd_earlyout_kernel(
     // Every lane reaches the vote.  For C<=32, each packed segment supplies
     // only its own lanes in the mask, so neighboring groups cannot keep one
     // another on the expensive path.
-    const float go = active ? gout[group * C + c] : 0.f;
+    const float go = active
+        ? gout[b * gout_row_stride + gout_col_offset + t * C + c] * scale
+        : 0.f;
     const bool segment_has_nonzero = __ballot_sync(segment_mask, go != 0.f) != 0u;
 
     if (active && segment_has_nonzero) {
@@ -489,7 +474,7 @@ __global__ void kplanes_tilted_bwd_earlyout_kernel(
 // the shuffles avoids keeping the sparse-path predicate live across the dense
 // tap/load schedule while still bypassing zero-valued coordinate atomics.
 template <typename GridT>
-__global__ void kplanes_tilted_bwd_threshold_kernel(
+__device__ __forceinline__ void kplanes_tilted_bwd_threshold_body(
     const float *__restrict__ pts,
     const float *__restrict__ R,
     const GridT *__restrict__ grid, // [3T, H, W, C] channels-last
@@ -498,9 +483,12 @@ __global__ void kplanes_tilted_bwd_threshold_kernel(
     float *__restrict__ gR,         // [T, 3, 3], pre-zeroed
     float *__restrict__ gpts,       // [B, 3], pre-zeroed
     long B, int T, int C, int H, int W,
-    float zero_tau
+    long gout_row_stride, long gout_col_offset,
+    float scale,
+    float zero_tau,
+    long block_index,
+    float *smem
 ) {
-    extern __shared__ float smem[]; // [T*9] R copy | [T*9] gR partials
     float *sR = smem;
     float *sgR = smem + T * 9;
     for (int i = threadIdx.x; i < T * 9; i += blockDim.x) {
@@ -512,7 +500,7 @@ __global__ void kplanes_tilted_bwd_threshold_kernel(
     // This mapping is intentionally identical to the baseline kernel.  The
     // segment mask is consumed only by the votes around the dense body.
     const int lane = threadIdx.x & 31;
-    const long warp_id = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const long warp_id = (block_index * blockDim.x + threadIdx.x) >> 5;
     const int CW = C < 32 ? C : 32;
     long group;
     int c, lis;
@@ -549,7 +537,9 @@ __global__ void kplanes_tilted_bwd_threshold_kernel(
 
     // Every lane participates.  Packed C<=32 segments use disjoint masks, so
     // one segment's surviving gradient cannot keep its neighbor dense.
-    const float go = active ? gout[group * C + c] : 0.f;
+    const float go = active
+        ? gout[b * gout_row_stride + gout_col_offset + t * C + c] * scale
+        : 0.f;
     if (__ballot_sync(segment_mask, fabsf(go) > zero_tau) == 0u) {
         goto v5_segment_reduction;
     }
@@ -648,6 +638,168 @@ v5_block_epilogue:
     }
 }
 
+template <typename GridT>
+__global__ void kplanes_tilted_fwd_ms_kernel(
+    const float *__restrict__ pts,
+    const float *__restrict__ R,
+    const GridT *__restrict__ grid0,
+    const GridT *__restrict__ grid1,
+    const GridT *__restrict__ grid2,
+    float *__restrict__ out,
+    long B, int T,
+    int C0, int H0, int W0,
+    int C1, int H1, int W1,
+    int C2, int H2, int W2,
+    float scale0, float scale1, float scale2
+) {
+    const int level = (int)blockIdx.y;
+    const GridT *grid = grid0;
+    int C = C0, H = H0, W = W0;
+    long out_col_offset = 0;
+    float scale = scale0;
+    if (level == 1) {
+        grid = grid1;
+        C = C1;
+        H = H1;
+        W = W1;
+        out_col_offset = (long)T * C0;
+        scale = scale1;
+    } else if (level == 2) {
+        grid = grid2;
+        C = C2;
+        H = H2;
+        W = W2;
+        out_col_offset = (long)T * (C0 + C1);
+        scale = scale2;
+    }
+
+    const long level_elements = B * (long)(T * C);
+    if ((long)blockIdx.x * blockDim.x >= level_elements) return;
+
+    extern __shared__ float sR[];
+    for (int i = threadIdx.x; i < T * 9; i += blockDim.x) sR[i] = R[i];
+    __syncthreads();
+
+    const long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= level_elements) return;
+    const long out_row_stride = (long)T * (C0 + C1 + C2);
+    kplanes_tilted_fwd_body(
+        pts, sR, grid, out, tid, T, C, H, W,
+        out_row_stride, out_col_offset, scale);
+}
+
+__global__ void kplanes_tilted_bwd_kernel(
+    const float *__restrict__ pts,
+    const float *__restrict__ R,
+    const float *__restrict__ grid,
+    const float *__restrict__ gout,
+    float *__restrict__ ggrid,
+    float *__restrict__ gR,
+    float *__restrict__ gpts,
+    long B, int T, int C, int H, int W
+) {
+    extern __shared__ float smem[];
+    kplanes_tilted_bwd_body(
+        pts, R, grid, gout, ggrid, gR, gpts, B, T, C, H, W,
+        T * (long)C, 0, 1.f, blockIdx.x, smem);
+}
+
+template <typename GridT>
+__global__ void kplanes_tilted_bwd_earlyout_kernel(
+    const float *__restrict__ pts,
+    const float *__restrict__ R,
+    const GridT *__restrict__ grid,
+    const float *__restrict__ gout,
+    float *__restrict__ ggrid,
+    float *__restrict__ gR,
+    float *__restrict__ gpts,
+    long B, int T, int C, int H, int W
+) {
+    extern __shared__ float smem[];
+    kplanes_tilted_bwd_earlyout_body(
+        pts, R, grid, gout, ggrid, gR, gpts, B, T, C, H, W,
+        T * (long)C, 0, 1.f, blockIdx.x, smem);
+}
+
+template <typename GridT>
+__global__ void kplanes_tilted_bwd_threshold_kernel(
+    const float *__restrict__ pts,
+    const float *__restrict__ R,
+    const GridT *__restrict__ grid,
+    const float *__restrict__ gout,
+    float *__restrict__ ggrid,
+    float *__restrict__ gR,
+    float *__restrict__ gpts,
+    long B, int T, int C, int H, int W,
+    float zero_tau
+) {
+    extern __shared__ float smem[];
+    kplanes_tilted_bwd_threshold_body(
+        pts, R, grid, gout, ggrid, gR, gpts, B, T, C, H, W,
+        T * (long)C, 0, 1.f, zero_tau, blockIdx.x, smem);
+}
+
+template <typename GridT, int Variant>
+__global__ void kplanes_tilted_bwd_ms_kernel(
+    const float *__restrict__ pts,
+    const float *__restrict__ R,
+    const GridT *__restrict__ grid0,
+    const GridT *__restrict__ grid1,
+    const GridT *__restrict__ grid2,
+    const float *__restrict__ gout,
+    float *__restrict__ ggrid0,
+    float *__restrict__ ggrid1,
+    float *__restrict__ ggrid2,
+    float *__restrict__ gR,
+    float *__restrict__ gpts,
+    long B, int T,
+    int C0, int H0, int W0,
+    int C1, int H1, int W1,
+    int C2, int H2, int W2,
+    long gout_row_stride,
+    float scale0, float scale1, float scale2,
+    float zero_tau
+) {
+    const int level = (int)blockIdx.y;
+    const GridT *grid = grid0;
+    float *ggrid = ggrid0;
+    int C = C0, H = H0, W = W0;
+    long gout_col_offset = 0;
+    float scale = scale0;
+    if (level == 1) {
+        grid = grid1;
+        ggrid = ggrid1;
+        C = C1;
+        H = H1;
+        W = W1;
+        gout_col_offset = (long)T * C0;
+        scale = scale1;
+    } else if (level == 2) {
+        grid = grid2;
+        ggrid = ggrid2;
+        C = C2;
+        H = H2;
+        W = W2;
+        gout_col_offset = (long)T * (C0 + C1);
+        scale = scale2;
+    }
+
+    extern __shared__ float smem[];
+    if constexpr (Variant == 0) {
+        kplanes_tilted_bwd_body(
+            pts, R, grid, gout, ggrid, gR, gpts, B, T, C, H, W,
+            gout_row_stride, gout_col_offset, scale, blockIdx.x, smem);
+    } else if constexpr (Variant == 3 || Variant == 4) {
+        kplanes_tilted_bwd_earlyout_body(
+            pts, R, grid, gout, ggrid, gR, gpts, B, T, C, H, W,
+            gout_row_stride, gout_col_offset, scale, blockIdx.x, smem);
+    } else {
+        kplanes_tilted_bwd_threshold_body(
+            pts, R, grid, gout, ggrid, gR, gpts, B, T, C, H, W,
+            gout_row_stride, gout_col_offset, scale, zero_tau, blockIdx.x, smem);
+    }
+}
+
 constexpr int kThreads = 256;
 
 inline int n_blocks(long n) { return (int)((n + kThreads - 1) / kThreads); }
@@ -693,13 +845,15 @@ void kplanes_tilted_fuse_cuda(
     if (B == 0) return;
     const size_t shmem = (size_t)T * 9 * sizeof(float);
     if (grid_is_bf16) {
-        kplanes_tilted_fwd_bf16_kernel<<<
+        kplanes_tilted_fwd_kernel<__nv_bfloat16><<<
             n_blocks(B * (long)(T * C)), kThreads, shmem, stream>>>(
             d_pts, d_R, static_cast<const __nv_bfloat16 *>(d_grid),
             d_out, B, T, C, H, W);
     } else {
-        kplanes_tilted_fwd_kernel<<<n_blocks(B * (long)(T * C)), kThreads, shmem, stream>>>(
-            d_pts, d_R, static_cast<const float *>(d_grid), d_out, B, T, C, H, W);
+        kplanes_tilted_fwd_kernel<float><<<
+            n_blocks(B * (long)(T * C)), kThreads, shmem, stream>>>(
+            d_pts, d_R, static_cast<const float *>(d_grid),
+            d_out, B, T, C, H, W);
     }
     CUDA_CHECK_KERNEL();
 }
@@ -772,6 +926,136 @@ void kplanes_tilted_fuse_grad_cuda(
             d_ggrid, d_gR, d_gpts, B, T, C, H, W);
         break;
     }
+    CUDA_CHECK_KERNEL();
+}
+
+void kplanes_tilted_fuse_ms_cuda(
+    const float *d_pts,
+    const float *d_R,
+    const void *d_grid0,
+    const void *d_grid1,
+    const void *d_grid2,
+    float *d_out,
+    long B, int T,
+    int C0, int H0, int W0,
+    int C1, int H1, int W1,
+    int C2, int H2, int W2,
+    float scale0, float scale1, float scale2,
+    bool grid_is_bf16,
+    cudaStream_t stream
+) {
+    if (B == 0) return;
+    int blocks = n_blocks(B * (long)(T * C0));
+    const int blocks1 = n_blocks(B * (long)(T * C1));
+    const int blocks2 = n_blocks(B * (long)(T * C2));
+    if (blocks1 > blocks) blocks = blocks1;
+    if (blocks2 > blocks) blocks = blocks2;
+    const dim3 grid_dim(blocks, 3);
+    const size_t shmem = (size_t)T * 9 * sizeof(float);
+    if (grid_is_bf16) {
+        kplanes_tilted_fwd_ms_kernel<__nv_bfloat16><<<
+            grid_dim, kThreads, shmem, stream>>>(
+            d_pts, d_R,
+            static_cast<const __nv_bfloat16 *>(d_grid0),
+            static_cast<const __nv_bfloat16 *>(d_grid1),
+            static_cast<const __nv_bfloat16 *>(d_grid2),
+            d_out, B, T,
+            C0, H0, W0, C1, H1, W1, C2, H2, W2,
+            scale0, scale1, scale2);
+    } else {
+        kplanes_tilted_fwd_ms_kernel<float><<<grid_dim, kThreads, shmem, stream>>>(
+            d_pts, d_R,
+            static_cast<const float *>(d_grid0),
+            static_cast<const float *>(d_grid1),
+            static_cast<const float *>(d_grid2),
+            d_out, B, T,
+            C0, H0, W0, C1, H1, W1, C2, H2, W2,
+            scale0, scale1, scale2);
+    }
+    CUDA_CHECK_KERNEL();
+}
+
+void kplanes_tilted_fuse_ms_grad_cuda(
+    const float *d_pts,
+    const float *d_R,
+    const void *d_grid0,
+    const void *d_grid1,
+    const void *d_grid2,
+    const float *d_gout,
+    float *d_ggrid0,
+    float *d_ggrid1,
+    float *d_ggrid2,
+    float *d_gR,
+    float *d_gpts,
+    long B, int T,
+    int C0, int H0, int W0,
+    int C1, int H1, int W1,
+    int C2, int H2, int W2,
+    long gout_row_stride,
+    float scale0, float scale1, float scale2,
+    bool grid_is_bf16,
+    cudaStream_t stream
+) {
+    if (B == 0) return;
+    const auto blocks_for = [B, T](int C) {
+        long n_warps;
+        if (C <= 32) {
+            const int spw = 32 / (C < 32 ? C : 32);
+            n_warps = (B * (long)T + spw - 1) / spw;
+        } else {
+            n_warps = B * (long)T * ((C + 31) >> 5);
+        }
+        return n_blocks(n_warps * 32);
+    };
+    int blocks = blocks_for(C0);
+    const int blocks1 = blocks_for(C1);
+    const int blocks2 = blocks_for(C2);
+    if (blocks1 > blocks) blocks = blocks1;
+    if (blocks2 > blocks) blocks = blocks2;
+
+    const dim3 grid_dim(blocks, 3);
+    const size_t shmem = (size_t)T * 18 * sizeof(float);
+    const KplanesTiltedBwdConfig &config = kplanes_tilted_bwd_config();
+    const int variant = config.variant;
+    if (grid_is_bf16 && variant != 4 && variant != 5) {
+        throw std::invalid_argument(
+            "bf16 kplanes grid requires QUANTEM_KPLANES_BWD_VARIANT=4 or 5 "
+            "at process startup");
+    }
+
+#define LAUNCH_MS_BWD(GridT, Variant)                                                    \
+    kplanes_tilted_bwd_ms_kernel<GridT, Variant><<<grid_dim, kThreads, shmem, stream>>>( \
+        d_pts, d_R,                                                                      \
+        static_cast<const GridT *>(d_grid0),                                              \
+        static_cast<const GridT *>(d_grid1),                                              \
+        static_cast<const GridT *>(d_grid2),                                              \
+        d_gout, d_ggrid0, d_ggrid1, d_ggrid2, d_gR, d_gpts, B, T,                        \
+        C0, H0, W0, C1, H1, W1, C2, H2, W2, gout_row_stride,                             \
+        scale0, scale1, scale2, config.zero_tau)
+
+    switch (variant) {
+    case 3:
+        LAUNCH_MS_BWD(float, 3);
+        break;
+    case 4:
+        if (grid_is_bf16) {
+            LAUNCH_MS_BWD(__nv_bfloat16, 4);
+        } else {
+            LAUNCH_MS_BWD(float, 4);
+        }
+        break;
+    case 5:
+        if (grid_is_bf16) {
+            LAUNCH_MS_BWD(__nv_bfloat16, 5);
+        } else {
+            LAUNCH_MS_BWD(float, 5);
+        }
+        break;
+    default:
+        LAUNCH_MS_BWD(float, 0);
+        break;
+    }
+#undef LAUNCH_MS_BWD
     CUDA_CHECK_KERNEL();
 }
 
