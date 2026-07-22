@@ -123,11 +123,11 @@ def test_backward_variant_smoke():
 
 @requires_cuda
 @pytest.mark.skipif(
-    os.environ.get("QUANTEM_KPLANES_BWD_VARIANT") != "4",
-    reason="bf16 plane storage is only enabled for backward variant 4",
+    os.environ.get("QUANTEM_KPLANES_BWD_VARIANT") not in {"4", "5"},
+    reason="bf16 plane storage is only enabled for backward variants 4 and 5",
 )
 def test_backward_variant_bf16_smoke():
-    """V4 reads bf16 grid storage but exposes fp32 custom-op gradients."""
+    """V4/V5 read bf16 grid storage but expose fp32 custom-op gradients."""
     pts, rotations, plane = _inputs(37, 2, 5, 7, 9, seed=23)
     plane_bf16 = plane.to(torch.bfloat16)
     upstream = torch.randn(37, 10, device="cuda")
@@ -153,14 +153,77 @@ def test_backward_variant_bf16_smoke():
 
 
 @requires_cuda
-@pytest.mark.parametrize("variant", [0, 3, 4])
+@pytest.mark.parametrize("variant", [0, 3, 4, 5])
 def test_backward_variant_sweep(variant):
     """The cached launcher selector requires one subprocess per experiment."""
-    target = "test_backward_variant_bf16_smoke" if variant == 4 else "test_backward_variant_smoke"
+    targets = (
+        ["test_backward_variant_smoke", "test_backward_variant_bf16_smoke"]
+        if variant == 5
+        else [
+            "test_backward_variant_bf16_smoke" if variant == 4 else "test_backward_variant_smoke"
+        ]
+    )
     env = os.environ.copy()
     env["QUANTEM_KPLANES_BWD_VARIANT"] = str(variant)
+    env.pop("QUANTEM_KPLANES_BWD_ZERO_TAU", None)
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", f"{__file__}::{target}", "-q"],
+        [sys.executable, "-m", "pytest", *(f"{__file__}::{target}" for target in targets), "-q"],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@requires_cuda
+@pytest.mark.skipif(
+    os.environ.get("QUANTEM_KPLANES_BWD_VARIANT") != "5"
+    or os.environ.get("QUANTEM_KPLANES_BWD_ZERO_TAU") != "1e-3",
+    reason="requires the V5 tau subprocess",
+)
+def test_backward_variant_threshold_smoke():
+    """V5 drops only segments whose every upstream magnitude is below tau."""
+    B, T, C, H, W = 11, 2, 5, 7, 9
+    pts, rotations, plane = _inputs(B, T, C, H, W, seed=29)
+
+    below = torch.full((B, T * C), 5e-4, device="cuda")
+    below[:, 1::2] *= -1
+    all_dropped = _kplanes_tilted_fuse_bwd(pts, rotations, plane, below)
+    for grad in all_dropped:
+        assert torch.count_nonzero(grad).item() == 0
+
+    mixed = below.clone().reshape(-1, C)
+    mixed[1::2, 0] = 2e-3
+    mixed[1::4, 1] = -3e-3
+    mixed = mixed.reshape(B, T * C)
+    kept = mixed.clone().reshape(-1, C)
+    kept[::2] = 0.0
+    kept = kept.reshape_as(mixed)
+
+    expected_inputs = tuple(
+        tensor.detach().requires_grad_(True) for tensor in (pts, rotations, plane)
+    )
+    expected = torch.autograd.grad((reference(*expected_inputs) * kept).sum(), expected_inputs)
+    actual = _kplanes_tilted_fuse_bwd(pts, rotations, plane, mixed)
+    for expected_grad, actual_grad in zip(expected, actual):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=2e-4, atol=2e-6)
+
+
+@requires_cuda
+def test_backward_variant_threshold():
+    """The threshold is process-cached alongside the V5 selector."""
+    env = os.environ.copy()
+    env["QUANTEM_KPLANES_BWD_VARIANT"] = "5"
+    env["QUANTEM_KPLANES_BWD_ZERO_TAU"] = "1e-3"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            f"{__file__}::test_backward_variant_threshold_smoke",
+            "-q",
+        ],
         capture_output=True,
         check=False,
         env=env,

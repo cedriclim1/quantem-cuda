@@ -261,7 +261,7 @@ def kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor
         pts:       fp32 CUDA tensor ``[B, 3]``, coordinates in ``[-1, 1]``.
         rotations: fp32 CUDA tensor ``[T, 3, 3]``.
         plane:     fp32 CUDA tensor ``[3*T, C, H, W]`` (plane ``t*3 + p``), or
-                   bf16 when ``QUANTEM_KPLANES_BWD_VARIANT=4``.
+                   bf16 when ``QUANTEM_KPLANES_BWD_VARIANT`` is 4 or 5.
 
     Returns:
         fp32 tensor ``[B, T*C]`` (``out[b, t*C + c]``), differentiable.
@@ -282,13 +282,13 @@ def kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor
             raise TypeError(f"kplanes_tilted_fuse is fp32-only ({name} is {t.dtype}).")
         if not t.is_cuda:
             raise ValueError(f"kplanes_tilted_fuse requires CUDA tensors ({name} on {t.device}).")
-    bf16_v4 = (
-        plane.dtype == torch.bfloat16 and os.environ.get("QUANTEM_KPLANES_BWD_VARIANT") == "4"
-    )
-    if plane.dtype != torch.float32 and not bf16_v4:
+    bf16_experiment = plane.dtype == torch.bfloat16 and os.environ.get(
+        "QUANTEM_KPLANES_BWD_VARIANT"
+    ) in {"4", "5"}
+    if plane.dtype != torch.float32 and not bf16_experiment:
         raise TypeError(
             "kplanes_tilted_fuse is fp32-only unless "
-            "QUANTEM_KPLANES_BWD_VARIANT=4 selects a bf16 plane "
+            "QUANTEM_KPLANES_BWD_VARIANT=4 or 5 selects a bf16 plane "
             f"(plane is {plane.dtype})."
         )
     if not plane.is_cuda:

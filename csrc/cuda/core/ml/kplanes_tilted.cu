@@ -481,18 +481,202 @@ __global__ void kplanes_tilted_bwd_earlyout_kernel(
     }
 }
 
+// V5: thresholded segment early-out for both fp32 and bf16 grid storage.
+//
+// Unlike V3, the skip predicate is not kept live across the dense body.  Empty
+// segments branch directly to the common shuffle sequence and dense segments
+// fall through into the baseline body.  A second cheap ballot after
+// the shuffles avoids keeping the sparse-path predicate live across the dense
+// tap/load schedule while still bypassing zero-valued coordinate atomics.
+template <typename GridT>
+__global__ void kplanes_tilted_bwd_threshold_kernel(
+    const float *__restrict__ pts,
+    const float *__restrict__ R,
+    const GridT *__restrict__ grid, // [3T, H, W, C] channels-last
+    const float *__restrict__ gout, // [B, T*C]
+    float *__restrict__ ggrid,      // [3T, H, W, C], pre-zeroed fp32
+    float *__restrict__ gR,         // [T, 3, 3], pre-zeroed
+    float *__restrict__ gpts,       // [B, 3], pre-zeroed
+    long B, int T, int C, int H, int W,
+    float zero_tau
+) {
+    extern __shared__ float smem[]; // [T*9] R copy | [T*9] gR partials
+    float *sR = smem;
+    float *sgR = smem + T * 9;
+    for (int i = threadIdx.x; i < T * 9; i += blockDim.x) {
+        sR[i] = R[i];
+        sgR[i] = 0.f;
+    }
+    __syncthreads();
+
+    // This mapping is intentionally identical to the baseline kernel.  The
+    // segment mask is consumed only by the votes around the dense body.
+    const int lane = threadIdx.x & 31;
+    const long warp_id = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int CW = C < 32 ? C : 32;
+    long group;
+    int c, lis;
+    bool active;
+    unsigned int segment_mask;
+    if (C <= 32) {
+        const int spw = 32 / CW;
+        const int seg = lane / CW;
+        lis = lane - seg * CW;
+        group = warp_id * spw + seg;
+        c = lis;
+        active = seg < spw && group < B * (long)T;
+        if (seg < spw) {
+            const unsigned int low_cw_bits = 0xffffffffu >> (32 - CW);
+            segment_mask = low_cw_bits << (seg * CW);
+        } else {
+            segment_mask = 1u << lane;
+        }
+    } else {
+        const int wpg = (C + 31) >> 5;
+        group = warp_id / wpg;
+        lis = lane;
+        c = (int)(warp_id - group * wpg) * 32 + lane;
+        active = group < B * (long)T && c < C;
+        segment_mask = 0xffffffffu;
+    }
+
+    const long g_safe = group < B * (long)T ? group : 0;
+    const long b = g_safe / T;
+    const int t = (int)(g_safe - b * T);
+
+    float dgx[3] = {0.f, 0.f, 0.f};
+    float dgy[3] = {0.f, 0.f, 0.f};
+
+    // Every lane participates.  Packed C<=32 segments use disjoint masks, so
+    // one segment's surviving gradient cannot keep its neighbor dense.
+    const float go = active ? gout[group * C + c] : 0.f;
+    if (__ballot_sync(segment_mask, fabsf(go) > zero_tau) == 0u) {
+        goto v5_segment_reduction;
+    }
+
+    // Dense fall-through: keep the baseline tap/load/atomic body unchanged.
+    // Inputs are scoped locally to shorten live ranges; GridT adds only the
+    // inlined conversion in the bf16 instantiation.
+    if (active) {
+        const float px = pts[3 * b], py = pts[3 * b + 1], pz = pts[3 * b + 2];
+        float rx, ry, rz;
+        rotate(sR + t * 9, px, py, pz, rx, ry, rz);
+        const long planeHWC = (long)H * W * C;
+        const float gxs[3] = {rx, rz, ry};
+        const float gys[3] = {ry, rx, rz};
+        Tap tap[3];
+        float s[3], dsdix[3], dsdiy[3];
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            tap[p] = make_tap(gxs[p], gys[p], H, W, C);
+            const Tap tp = tap[p];
+            const GridT *pc = grid + (long)(t * 3 + p) * planeHWC + c;
+            const float v0 = grid_value(pc, tp.off[0]);
+            const float v1 = grid_value(pc, tp.off[1]);
+            const float v2 = grid_value(pc, tp.off[2]);
+            const float v3 = grid_value(pc, tp.off[3]);
+            s[p] = v0 * tp.w[0] + v1 * tp.w[1] + v2 * tp.w[2] + v3 * tp.w[3];
+            dsdix[p] = (1.f - tp.ty) * (v1 - v0) + tp.ty * (v3 - v2);
+            dsdiy[p] = (1.f - tp.tx) * (v2 - v0) + tp.tx * (v3 - v1);
+        }
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            const float other = s[(p + 1) % 3] * s[(p + 2) % 3] * go;
+            const Tap tp = tap[p];
+            float *gpc = ggrid + (long)(t * 3 + p) * planeHWC + c;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float val = other * tp.w[k];
+                if (val != 0.f) atomicAdd(&gpc[tp.off[k]], val);
+            }
+            dgx[p] += other * dsdix[p];
+            dgy[p] += other * dsdiy[p];
+        }
+    }
+
+v5_segment_reduction:
+#pragma unroll
+    for (int p = 0; p < 3; ++p) {
+        for (int off = 1; off < CW; off <<= 1) {
+            const float ox = __shfl_down_sync(0xffffffffu, dgx[p], off);
+            const float oy = __shfl_down_sync(0xffffffffu, dgy[p], off);
+            if (lis + off < CW) {
+                dgx[p] += ox;
+                dgy[p] += oy;
+            }
+        }
+    }
+
+    if (__ballot_sync(segment_mask, fabsf(go) > zero_tau) == 0u) goto v5_block_epilogue;
+
+    if (active && lis == 0) {
+        // As in the spill-free V1 experiment, recompute these leader-only
+        // values instead of keeping them live through sampling and shuffles.
+        const float px = pts[3 * b], py = pts[3 * b + 1], pz = pts[3 * b + 2];
+        const float *Rt = sR + t * 9;
+        float rx, ry, rz;
+        rotate(Rt, px, py, pz, rx, ry, rz);
+        const float gxs[3] = {rx, rz, ry};
+        const float gys[3] = {ry, rx, rz};
+        const Tap t0 = make_tap(gxs[0], gys[0], H, W, C);
+        const Tap t1 = make_tap(gxs[1], gys[1], H, W, C);
+        const Tap t2 = make_tap(gxs[2], gys[2], H, W, C);
+        const float drx = dgx[0] * t0.gxm + dgy[1] * t1.gym;
+        const float dry = dgy[0] * t0.gym + dgx[2] * t2.gxm;
+        const float drz = dgx[1] * t1.gxm + dgy[2] * t2.gym;
+
+        float *sg = sgR + t * 9;
+        atomicAdd(&sg[0], drx * px);
+        atomicAdd(&sg[1], drx * py);
+        atomicAdd(&sg[2], drx * pz);
+        atomicAdd(&sg[3], dry * px);
+        atomicAdd(&sg[4], dry * py);
+        atomicAdd(&sg[5], dry * pz);
+        atomicAdd(&sg[6], drz * px);
+        atomicAdd(&sg[7], drz * py);
+        atomicAdd(&sg[8], drz * pz);
+
+        atomicAdd(&gpts[3 * b], Rt[0] * drx + Rt[3] * dry + Rt[6] * drz);
+        atomicAdd(&gpts[3 * b + 1], Rt[1] * drx + Rt[4] * dry + Rt[7] * drz);
+        atomicAdd(&gpts[3 * b + 2], Rt[2] * drx + Rt[5] * dry + Rt[8] * drz);
+    }
+
+v5_block_epilogue:
+    __syncthreads();
+    for (int i = threadIdx.x; i < T * 9; i += blockDim.x) {
+        if (sgR[i] != 0.f) atomicAdd(&gR[i], sgR[i]);
+    }
+}
+
 constexpr int kThreads = 256;
 
 inline int n_blocks(long n) { return (int)((n + kThreads - 1) / kThreads); }
 
-inline int kplanes_tilted_bwd_variant() {
-    static const int variant = [] {
+struct KplanesTiltedBwdConfig {
+    int variant;
+    float zero_tau;
+};
+
+inline const KplanesTiltedBwdConfig &kplanes_tilted_bwd_config() {
+    static const KplanesTiltedBwdConfig config = [] {
+        KplanesTiltedBwdConfig result{0, 0.f};
         const char *value = std::getenv("QUANTEM_KPLANES_BWD_VARIANT");
-        if (value != nullptr && value[0] == '3' && value[1] == '\0') return 3;
-        if (value != nullptr && value[0] == '4' && value[1] == '\0') return 4;
-        return 0;
+        if (value != nullptr && value[0] != '\0' && value[1] == '\0') {
+            if (value[0] == '3') result.variant = 3;
+            if (value[0] == '4') result.variant = 4;
+            if (value[0] == '5') result.variant = 5;
+        }
+        const char *tau_value = std::getenv("QUANTEM_KPLANES_BWD_ZERO_TAU");
+        if (tau_value != nullptr) {
+            char *end = nullptr;
+            const float parsed = std::strtof(tau_value, &end);
+            // tau > 0 is explicitly approximate.  It mirrors the useful
+            // underflow sparsity seen under fp16 autocast; zero remains exact.
+            if (end != tau_value && end[0] == '\0' && parsed >= 0.f) result.zero_tau = parsed;
+        }
+        return result;
     }();
-    return variant;
+    return config;
 }
 
 } // namespace
@@ -541,10 +725,12 @@ void kplanes_tilted_fuse_grad_cuda(
         n_warps = B * (long)T * ((C + 31) >> 5);
     }
     const size_t shmem = (size_t)T * 18 * sizeof(float);
-    const int variant = kplanes_tilted_bwd_variant();
-    if (grid_is_bf16 && variant != 4) {
+    const KplanesTiltedBwdConfig &config = kplanes_tilted_bwd_config();
+    const int variant = config.variant;
+    if (grid_is_bf16 && variant != 4 && variant != 5) {
         throw std::invalid_argument(
-            "bf16 kplanes grid requires QUANTEM_KPLANES_BWD_VARIANT=4 at process startup");
+            "bf16 kplanes grid requires QUANTEM_KPLANES_BWD_VARIANT=4 or 5 "
+            "at process startup");
     }
     switch (variant) {
     case 3:
@@ -566,6 +752,20 @@ void kplanes_tilted_fuse_grad_cuda(
                 d_ggrid, d_gR, d_gpts, B, T, C, H, W);
         }
         break;
+    case 5: {
+        if (grid_is_bf16) {
+            kplanes_tilted_bwd_threshold_kernel<__nv_bfloat16><<<
+                n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
+                d_pts, d_R, static_cast<const __nv_bfloat16 *>(d_grid), d_gout,
+                d_ggrid, d_gR, d_gpts, B, T, C, H, W, config.zero_tau);
+        } else {
+            kplanes_tilted_bwd_threshold_kernel<float><<<
+                n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
+                d_pts, d_R, static_cast<const float *>(d_grid), d_gout,
+                d_ggrid, d_gR, d_gpts, B, T, C, H, W, config.zero_tau);
+        }
+        break;
+    }
     default:
         kplanes_tilted_bwd_kernel<<<n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
             d_pts, d_R, static_cast<const float *>(d_grid), d_gout,
