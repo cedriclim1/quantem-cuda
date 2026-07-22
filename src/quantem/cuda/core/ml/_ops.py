@@ -41,6 +41,100 @@ def _restore_plane_layout(grad_plane_cl: Tensor, plane: Tensor) -> Tensor:
     return grad_plane.contiguous()
 
 
+# ── three-level plane-wise 2-D squared TV ───────────────────────────────
+
+
+def _plane_tv_num_blocks(grids: tuple[Tensor, Tensor, Tensor]) -> int:
+    """Bound the deterministic partial buffer while retaining grid-stride coverage."""
+    max_elements = max(grid.numel() for grid in grids)
+    return min(1024, max(1, (max_elements + 255) // 256))
+
+
+@torch.library.custom_op("quantem_cuda::plane_tv_loss", mutates_args=())
+def _plane_tv_loss(plane0: Tensor, plane1: Tensor, plane2: Tensor, rotations: int) -> Tensor:
+    planes = (plane0, plane1, plane2)
+    grids = tuple(_channels_last(plane) for plane in planes)
+    dims = tuple(dim for plane in planes for dim in plane.shape)
+    num_blocks = _plane_tv_num_blocks(grids)
+    partials = torch.empty((3 * num_blocks,), dtype=torch.float32, device=plane0.device)
+    output = torch.empty((), dtype=torch.float32, device=plane0.device)
+    stream = torch.cuda.current_stream(plane0.device).cuda_stream
+    with torch.cuda.device(plane0.device):
+        _core.plane_tv_loss_cuda(
+            *(grid.data_ptr() for grid in grids),
+            partials.data_ptr(),
+            output.data_ptr(),
+            *dims,
+            rotations,
+            num_blocks,
+            stream,
+        )
+    return output
+
+
+@_plane_tv_loss.register_fake
+def _(plane0: Tensor, plane1: Tensor, plane2: Tensor, rotations: int) -> Tensor:
+    del plane1, plane2, rotations
+    return plane0.new_empty(())
+
+
+@torch.library.custom_op("quantem_cuda::plane_tv_loss_bwd", mutates_args=())
+def _plane_tv_loss_bwd(
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    grad_out: Tensor,
+    rotations: int,
+) -> list[Tensor]:
+    planes = (plane0, plane1, plane2)
+    grids = tuple(_channels_last(plane) for plane in planes)
+    dims = tuple(dim for plane in planes for dim in plane.shape)
+    num_blocks = _plane_tv_num_blocks(grids)
+    gout = grad_out.detach().to(dtype=torch.float32, device=plane0.device).reshape(1).contiguous()
+    grad_grids = tuple(torch.empty_like(grid) for grid in grids)
+    stream = torch.cuda.current_stream(plane0.device).cuda_stream
+    with torch.cuda.device(plane0.device):
+        _core.plane_tv_loss_grad_cuda(
+            *(grid.data_ptr() for grid in grids),
+            gout.data_ptr(),
+            *(grad_grid.data_ptr() for grad_grid in grad_grids),
+            *dims,
+            rotations,
+            num_blocks,
+            stream,
+        )
+    return [
+        _restore_plane_layout(grad_grid, plane) for grad_grid, plane in zip(grad_grids, planes)
+    ]
+
+
+@_plane_tv_loss_bwd.register_fake
+def _(
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    grad_out: Tensor,
+    rotations: int,
+) -> list[Tensor]:
+    del grad_out, rotations
+    return [torch.empty_like(plane0), torch.empty_like(plane1), torch.empty_like(plane2)]
+
+
+def _plane_tv_setup_context(ctx, inputs, output) -> None:
+    del output
+    plane0, plane1, plane2, rotations = inputs
+    ctx.save_for_backward(plane0, plane1, plane2)
+    ctx.rotations = rotations
+
+
+def _plane_tv_backward(ctx, grad_out):
+    plane0, plane1, plane2 = ctx.saved_tensors
+    return (*_plane_tv_loss_bwd(plane0, plane1, plane2, grad_out, ctx.rotations), None)
+
+
+_plane_tv_loss.register_autograd(_plane_tv_backward, setup_context=_plane_tv_setup_context)
+
+
 @torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse", mutates_args=())
 def _kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor:
     p = pts.contiguous()
@@ -390,6 +484,55 @@ _kplanes_tilted_tv_fuse.register_autograd(_kpt_tv_backward, setup_context=_kpt_t
 
 
 # ── public wrappers ───────────────────────────────────────────────────────
+
+
+def plane_tv_loss(plane0: Tensor, plane1: Tensor, plane2: Tensor) -> Tensor:
+    """Three-level plane-wise 2-D squared-TV loss with analytic backward.
+
+    Every input is a logical NCHW grid ``[3*T, C, H, W]``. For each grid,
+    this computes the mean squared H difference plus the mean squared W
+    difference independently for every plane, sums the three planes per
+    rotation, averages over ``T``, then sums the three grid levels. The H
+    and W means retain their distinct ``C*(H-1)*W`` and ``C*H*(W-1)``
+    denominators.
+
+    Production K-Planes parameters use channels-last physical storage, which
+    reaches the kernel without a copy. Other NCHW layouts are accepted via a
+    contiguous NHWC staging view and receive gradients in their original
+    contiguous layout.
+    """
+    name = "plane_tv_loss"
+    planes = (plane0, plane1, plane2)
+    rotations = None
+    device = plane0.device
+    for level, plane in enumerate(planes):
+        if plane.ndim != 4:
+            raise ValueError(
+                f"{name} expects plane{level} [3*T, C, H, W], got {tuple(plane.shape)}"
+            )
+        if plane.shape[0] == 0 or plane.shape[0] % 3 != 0:
+            raise ValueError(
+                f"{name} expects plane{level}.shape[0] to be 3*T, got {plane.shape[0]}"
+            )
+        level_rotations = plane.shape[0] // 3
+        if rotations is None:
+            rotations = level_rotations
+        elif level_rotations != rotations:
+            raise ValueError(f"{name} requires the same T for all three levels")
+        if plane.dtype != torch.float32:
+            raise TypeError(f"{name} is fp32-only (plane{level} is {plane.dtype}).")
+        if not plane.is_cuda:
+            raise ValueError(f"{name} requires CUDA tensors (plane{level} on {plane.device}).")
+        if plane.device != device:
+            raise ValueError(
+                f"{name} requires all planes on {device} (plane{level} on {plane.device})."
+            )
+        if any(dim == 0 for dim in plane.shape[1:]):
+            raise ValueError(f"{name} requires non-empty C/H/W dimensions")
+        if any(dim >= 2**31 for dim in plane.shape):
+            raise ValueError(f"{name} requires every grid dimension to fit in int32")
+    assert rotations is not None
+    return _plane_tv_loss(plane0, plane1, plane2, rotations)
 
 
 def kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor:
