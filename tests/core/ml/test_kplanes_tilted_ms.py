@@ -250,6 +250,67 @@ def test_ms_v5_bf16_gout_composes_with_threshold_ballot():
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout, result.stdout + result.stderr
+
+
+@requires_cuda
+@pytest.mark.skipif(
+    os.environ.get("QUANTEM_KPLANES_BWD_VARIANT") != "5"
+    or os.environ.get("QUANTEM_KPLANES_BWD_ZERO_TAU") != "1e-3",
+    reason="requires the V5 tau subprocess",
+)
+def test_ms_bf16_grid_and_gout_autocast_v5_smoke():
+    pts, rotations, grids = _inputs(seed=10, dtype=torch.bfloat16)
+    grids_fp32 = tuple(grid.float() for grid in grids)
+    expected_out = _multiscale(pts, rotations, *grids_fp32)
+
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        actual_out = _multiscale(pts, rotations, *grids)
+
+    assert actual_out.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        actual_out, expected_out.to(torch.bfloat16), rtol=2e-4, atol=2e-6
+    )
+
+    generator = torch.Generator(device="cuda").manual_seed(31)
+    upstream_bf16 = torch.empty_like(actual_out).uniform_(
+        -1.0, 1.0, generator=generator
+    )
+    upstream_bf16[:, ::5] = 0
+    upstream_bf16[:, 1::7] = torch.tensor(
+        5e-4, device="cuda", dtype=torch.bfloat16
+    )
+    actual_grads = _kplanes_tilted_fuse_ms_bwd(
+        pts, rotations, *grids, upstream_bf16, *GATES
+    )
+    expected_grads = _kplanes_tilted_fuse_ms_bwd(
+        pts, rotations, *grids_fp32, upstream_bf16.float(), *GATES
+    )
+    for expected_grad, actual_grad in zip(expected_grads, actual_grads):
+        torch.testing.assert_close(actual_grad, expected_grad, rtol=3e-4, atol=3e-6)
+
+
+@requires_cuda
+def test_ms_v5_bf16_grid_and_gout_autocast():
+    env = os.environ.copy()
+    env["QUANTEM_KPLANES_BWD_VARIANT"] = "5"
+    env["QUANTEM_KPLANES_BWD_ZERO_TAU"] = "1e-3"
+    env["QUANTEM_KPLANES_MS_BF16_OUT"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            f"{__file__}::test_ms_bf16_grid_and_gout_autocast_v5_smoke",
+            "-q",
+        ],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "1 passed" in result.stdout, result.stdout + result.stderr
 
 
 @requires_cuda
@@ -293,6 +354,7 @@ def test_ms_backward_variant_sweep(variant):
         text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+    assert f"{len(targets)} passed" in result.stdout, result.stdout + result.stderr
 
 
 @requires_cuda
