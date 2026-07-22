@@ -16,6 +16,49 @@ namespace py = pybind11;
 
 namespace quantem_cuda {
 
+static void py_plane_tv_loss_cuda(
+    long grid0_ptr, long grid1_ptr, long grid2_ptr,
+    long partials_ptr, long output_ptr,
+    int P0, int C0, int H0, int W0,
+    int P1, int C1, int H1, int W1,
+    int P2, int C2, int H2, int W2,
+    int rotations, int num_blocks,
+    long stream_ptr
+) {
+    plane_tv_loss_cuda(
+        reinterpret_cast<const float *>(grid0_ptr),
+        reinterpret_cast<const float *>(grid1_ptr),
+        reinterpret_cast<const float *>(grid2_ptr),
+        reinterpret_cast<float *>(partials_ptr),
+        reinterpret_cast<float *>(output_ptr),
+        P0, C0, H0, W0, P1, C1, H1, W1, P2, C2, H2, W2,
+        rotations, num_blocks, to_stream(stream_ptr)
+    );
+}
+
+static void py_plane_tv_loss_grad_cuda(
+    long grid0_ptr, long grid1_ptr, long grid2_ptr,
+    long grad_output_ptr,
+    long grad_grid0_ptr, long grad_grid1_ptr, long grad_grid2_ptr,
+    int P0, int C0, int H0, int W0,
+    int P1, int C1, int H1, int W1,
+    int P2, int C2, int H2, int W2,
+    int rotations, int num_blocks,
+    long stream_ptr
+) {
+    plane_tv_loss_grad_cuda(
+        reinterpret_cast<const float *>(grid0_ptr),
+        reinterpret_cast<const float *>(grid1_ptr),
+        reinterpret_cast<const float *>(grid2_ptr),
+        reinterpret_cast<const float *>(grad_output_ptr),
+        reinterpret_cast<float *>(grad_grid0_ptr),
+        reinterpret_cast<float *>(grad_grid1_ptr),
+        reinterpret_cast<float *>(grad_grid2_ptr),
+        P0, C0, H0, W0, P1, C1, H1, W1, P2, C2, H2, W2,
+        rotations, num_blocks, to_stream(stream_ptr)
+    );
+}
+
 static void py_kplanes_tilted_fuse_cuda(
     long pts_ptr, long r_ptr, long grid_ptr, long out_ptr,
     long B, int T, int C, int H, int W,
@@ -156,6 +199,27 @@ static void py_kplanes_tilted_tv_fuse_grad_cuda(
 }
 
 void register_core_ml_ops(py::module_ &m) {
+    m.def("plane_tv_loss_cuda", &py_plane_tv_loss_cuda,
+          "Three-level plane-wise 2-D squared-TV forward. Grids are fp32 "
+          "[3*T,H,W,C] channels-last; output is one fp32 scalar.",
+          py::arg("grid0_ptr"), py::arg("grid1_ptr"), py::arg("grid2_ptr"),
+          py::arg("partials_ptr"), py::arg("output_ptr"),
+          py::arg("P0"), py::arg("C0"), py::arg("H0"), py::arg("W0"),
+          py::arg("P1"), py::arg("C1"), py::arg("H1"), py::arg("W1"),
+          py::arg("P2"), py::arg("C2"), py::arg("H2"), py::arg("W2"),
+          py::arg("rotations"), py::arg("num_blocks"), py::arg("stream_ptr"));
+
+    m.def("plane_tv_loss_grad_cuda", &py_plane_tv_loss_grad_cuda,
+          "Analytic backward of plane_tv_loss; fully writes three fp32 gradients.",
+          py::arg("grid0_ptr"), py::arg("grid1_ptr"), py::arg("grid2_ptr"),
+          py::arg("grad_output_ptr"),
+          py::arg("grad_grid0_ptr"), py::arg("grad_grid1_ptr"),
+          py::arg("grad_grid2_ptr"),
+          py::arg("P0"), py::arg("C0"), py::arg("H0"), py::arg("W0"),
+          py::arg("P1"), py::arg("C1"), py::arg("H1"), py::arg("W1"),
+          py::arg("P2"), py::arg("C2"), py::arg("H2"), py::arg("W2"),
+          py::arg("rotations"), py::arg("num_blocks"), py::arg("stream_ptr"));
+
     m.def("kplanes_tilted_fuse_cuda", &py_kplanes_tilted_fuse_cuda,
           "Fused TILTED K-Planes interpolation (one level). pts_ptr: fp32 "
           "[B,3]; r_ptr: fp32 [T,3,3]; grid_ptr: fp32 or bf16 "

@@ -8,6 +8,31 @@
 
 #include <cuda_runtime.h>
 
+/* Three-level plane-wise 2-D squared-TV loss. Grids are fp32 channels-last
+ * [3*T,H,W,C]. Forward writes one scalar after applying each plane's distinct
+ * H/W mean denominator and averaging over T. Backward fully writes all three
+ * fp32 gradient grids. */
+void plane_tv_loss_cuda(
+    const float *d_grid0, const float *d_grid1, const float *d_grid2,
+    float *d_partials, float *d_output,
+    int P0, int C0, int H0, int W0,
+    int P1, int C1, int H1, int W1,
+    int P2, int C2, int H2, int W2,
+    int rotations, int num_blocks,
+    cudaStream_t stream
+);
+
+void plane_tv_loss_grad_cuda(
+    const float *d_grid0, const float *d_grid1, const float *d_grid2,
+    const float *d_grad_output,
+    float *d_grad_grid0, float *d_grad_grid1, float *d_grad_grid2,
+    int P0, int C0, int H0, int W0,
+    int P1, int C1, int H1, int W1,
+    int P2, int C2, int H2, int W2,
+    int rotations, int num_blocks,
+    cudaStream_t stream
+);
+
 /* Fused TILTED K-Planes feature interpolation (one multiscale level):
  * rotate each point by T matrices, bilinearly sample the 3 planes per
  * rotation (grid_sample align_corners=True / border semantics), Hadamard-
