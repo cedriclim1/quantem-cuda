@@ -6,12 +6,20 @@ The reference is a standalone copy of quantem's
 code path.
 """
 
+import os
+import subprocess
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from quantem.cuda.core.ml import kplanes_tilted_fuse, kplanes_tilted_tv_fuse
-from quantem.cuda.core.ml._ops import _channels_last, _restore_plane_layout
+from quantem.cuda.core.ml._ops import (
+    _channels_last,
+    _kplanes_tilted_fuse_bwd,
+    _restore_plane_layout,
+)
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
 
@@ -94,6 +102,71 @@ def test_grads_match_fp64_reference(cfg):
         assert err_kernel <= max(2.0 * err_torch, 1e-6), (
             f"grad_{name}: kernel err {err_kernel:.3e} vs torch fp32 err {err_torch:.3e}"
         )
+
+
+@requires_cuda
+def test_backward_variant_smoke():
+    """Odd packed segments with alternating all-zero upstream groups."""
+    pts, rotations, plane = _inputs(37, 2, 5, 7, 9, seed=17)
+    upstream = torch.randn_like(reference(pts, rotations, plane))
+    upstream_groups = upstream.reshape(-1, plane.shape[1])
+    upstream_groups[::2] = 0.0
+    upstream = upstream_groups.reshape_as(upstream)
+
+    def grads(fn):
+        inp = tuple(t.detach().requires_grad_(True) for t in (pts, rotations, plane))
+        return torch.autograd.grad((fn(*inp) * upstream).sum(), inp)
+
+    for expected, actual in zip(grads(reference), grads(kplanes_tilted_fuse)):
+        torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-6)
+
+
+@requires_cuda
+@pytest.mark.skipif(
+    os.environ.get("QUANTEM_KPLANES_BWD_VARIANT") != "4",
+    reason="bf16 plane storage is only enabled for backward variant 4",
+)
+def test_backward_variant_bf16_smoke():
+    """V4 reads bf16 grid storage but exposes fp32 custom-op gradients."""
+    pts, rotations, plane = _inputs(37, 2, 5, 7, 9, seed=23)
+    plane_bf16 = plane.to(torch.bfloat16)
+    upstream = torch.randn(37, 10, device="cuda")
+    upstream_groups = upstream.reshape(-1, plane.shape[1])
+    upstream_groups[::2] = 0.0
+    upstream = upstream_groups.reshape_as(upstream)
+
+    expected_plane = plane_bf16.float()
+    expected_out = reference(pts, rotations, expected_plane)
+    actual_out = kplanes_tilted_fuse(pts, rotations, plane_bf16)
+    torch.testing.assert_close(actual_out, expected_out, rtol=2e-4, atol=2e-6)
+
+    expected_inputs = tuple(
+        t.detach().requires_grad_(True) for t in (pts, rotations, expected_plane)
+    )
+    expected_grads = torch.autograd.grad(
+        (reference(*expected_inputs) * upstream).sum(), expected_inputs
+    )
+    actual_grads = _kplanes_tilted_fuse_bwd(pts, rotations, plane_bf16, upstream)
+    assert actual_grads[2].dtype == torch.float32
+    for expected, actual in zip(expected_grads, actual_grads):
+        torch.testing.assert_close(actual, expected, rtol=2e-4, atol=2e-6)
+
+
+@requires_cuda
+@pytest.mark.parametrize("variant", [0, 3, 4])
+def test_backward_variant_sweep(variant):
+    """The cached launcher selector requires one subprocess per experiment."""
+    target = "test_backward_variant_bf16_smoke" if variant == 4 else "test_backward_variant_smoke"
+    env = os.environ.copy()
+    env["QUANTEM_KPLANES_BWD_VARIANT"] = str(variant)
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", f"{__file__}::{target}", "-q"],
+        capture_output=True,
+        check=False,
+        env=env,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @requires_cuda

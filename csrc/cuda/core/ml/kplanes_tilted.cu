@@ -57,6 +57,11 @@
 #include "common.cuh"
 #include "ops/core/ml.h"
 
+#include <cstdlib>
+#include <stdexcept>
+
+#include <cuda_bf16.h>
+
 namespace {
 
 struct Tap {
@@ -136,6 +141,47 @@ __global__ void kplanes_tilted_fwd_kernel(
               + tp.w[3] * pc[tp.off[3]];
     }
     out[tid] = prod; // out[b, t*C + c] — tid is exactly that flat index
+}
+
+// V4's bf16 storage experiment needs a matching forward read path.  Keep the
+// original fp32 kernel above untouched so variant 0 has identical codegen.
+__global__ void kplanes_tilted_fwd_bf16_kernel(
+    const float *__restrict__ pts,
+    const float *__restrict__ R,
+    const __nv_bfloat16 *__restrict__ grid, // [3T, H, W, C] channels-last
+    float *__restrict__ out,
+    long B, int T, int C, int H, int W
+) {
+    extern __shared__ float sR[]; // [T*9]
+    for (int i = threadIdx.x; i < T * 9; i += blockDim.x) sR[i] = R[i];
+    __syncthreads();
+
+    const long tid = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= B * (long)(T * C)) return;
+    const long b = tid / (T * C);
+    const int rem = (int)(tid - b * (T * C));
+    const int t = rem / C;
+    const int c = rem - t * C;
+
+    const float px = pts[3 * b], py = pts[3 * b + 1], pz = pts[3 * b + 2];
+    float rx, ry, rz;
+    rotate(sR + t * 9, px, py, pz, rx, ry, rz);
+
+    const long planeHWC = (long)H * W * C;
+    const float gxs[3] = {rx, rz, ry};
+    const float gys[3] = {ry, rx, rz};
+
+    float prod = 1.f;
+#pragma unroll
+    for (int p = 0; p < 3; ++p) {
+        const Tap tp = make_tap(gxs[p], gys[p], H, W, C);
+        const __nv_bfloat16 *pc = grid + (long)(t * 3 + p) * planeHWC + c;
+        prod *= tp.w[0] * __bfloat162float(pc[tp.off[0]])
+              + tp.w[1] * __bfloat162float(pc[tp.off[1]])
+              + tp.w[2] * __bfloat162float(pc[tp.off[2]])
+              + tp.w[3] * __bfloat162float(pc[tp.off[3]]);
+    }
+    out[tid] = prod;
 }
 
 __global__ void kplanes_tilted_bwd_kernel(
@@ -280,36 +326,210 @@ __global__ void kplanes_tilted_bwd_kernel(
     }
 }
 
+__device__ __forceinline__ float grid_value(const float *p, int off) { return p[off]; }
+
+__device__ __forceinline__ float grid_value(const __nv_bfloat16 *p, int off) {
+    return __bfloat162float(p[off]);
+}
+
+// V3: baseline mapping and arithmetic with one segment-scoped zero-gout vote.
+// V4 instantiates the same kernel with bf16 grid storage; all arithmetic and
+// every gradient destination remain fp32.
+template <typename GridT>
+__global__ void kplanes_tilted_bwd_earlyout_kernel(
+    const float *__restrict__ pts,
+    const float *__restrict__ R,
+    const GridT *__restrict__ grid, // [3T, H, W, C] channels-last
+    const float *__restrict__ gout, // [B, T*C]
+    float *__restrict__ ggrid,      // [3T, H, W, C], pre-zeroed fp32
+    float *__restrict__ gR,         // [T, 3, 3], pre-zeroed
+    float *__restrict__ gpts,       // [B, 3], pre-zeroed
+    long B, int T, int C, int H, int W
+) {
+    extern __shared__ float smem[]; // [T*9] R copy | [T*9] gR partials
+    float *sR = smem;
+    float *sgR = smem + T * 9;
+    for (int i = threadIdx.x; i < T * 9; i += blockDim.x) {
+        sR[i] = R[i];
+        sgR[i] = 0.f;
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & 31;
+    const long warp_id = ((long)blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    const int CW = C < 32 ? C : 32;
+    long group;
+    int c, lis;
+    bool active;
+    unsigned int segment_mask;
+    if (C <= 32) {
+        const int spw = 32 / CW;
+        const int seg = lane / CW;
+        lis = lane - seg * CW;
+        group = warp_id * spw + seg;
+        c = lis;
+        active = seg < spw && group < B * (long)T;
+        if (seg < spw) {
+            const unsigned int low_cw_bits = 0xffffffffu >> (32 - CW);
+            segment_mask = low_cw_bits << (seg * CW);
+        } else {
+            // Lanes left over when C does not divide 32 are not a segment.
+            // Give each one a self-only vote so no mask names a nonparticipant.
+            segment_mask = 1u << lane;
+        }
+    } else {
+        const int wpg = (C + 31) >> 5;
+        group = warp_id / wpg;
+        lis = lane;
+        c = (int)(warp_id - group * wpg) * 32 + lane;
+        active = group < B * (long)T && c < C;
+        segment_mask = 0xffffffffu;
+    }
+
+    const long g_safe = group < B * (long)T ? group : 0;
+    const long b = g_safe / T;
+    const int t = (int)(g_safe - b * T);
+
+    const float px = pts[3 * b], py = pts[3 * b + 1], pz = pts[3 * b + 2];
+    const float *Rt = sR + t * 9;
+    float rx, ry, rz;
+    rotate(Rt, px, py, pz, rx, ry, rz);
+
+    const long planeHWC = (long)H * W * C;
+    const float gxs[3] = {rx, rz, ry};
+    const float gys[3] = {ry, rx, rz};
+
+    float dgx[3] = {0.f, 0.f, 0.f};
+    float dgy[3] = {0.f, 0.f, 0.f};
+
+    // Every lane reaches the vote.  For C<=32, each packed segment supplies
+    // only its own lanes in the mask, so neighboring groups cannot keep one
+    // another on the expensive path.
+    const float go = active ? gout[group * C + c] : 0.f;
+    const bool segment_has_nonzero = __ballot_sync(segment_mask, go != 0.f) != 0u;
+
+    if (active && segment_has_nonzero) {
+        Tap tap[3];
+        float s[3], dsdix[3], dsdiy[3];
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            tap[p] = make_tap(gxs[p], gys[p], H, W, C);
+            const Tap tp = tap[p];
+            const GridT *pc = grid + (long)(t * 3 + p) * planeHWC + c;
+            const float v0 = grid_value(pc, tp.off[0]);
+            const float v1 = grid_value(pc, tp.off[1]);
+            const float v2 = grid_value(pc, tp.off[2]);
+            const float v3 = grid_value(pc, tp.off[3]);
+            s[p] = v0 * tp.w[0] + v1 * tp.w[1] + v2 * tp.w[2] + v3 * tp.w[3];
+            dsdix[p] = (1.f - tp.ty) * (v1 - v0) + tp.ty * (v3 - v2);
+            dsdiy[p] = (1.f - tp.tx) * (v2 - v0) + tp.tx * (v3 - v1);
+        }
+#pragma unroll
+        for (int p = 0; p < 3; ++p) {
+            const float other = s[(p + 1) % 3] * s[(p + 2) % 3] * go;
+            const Tap tp = tap[p];
+            float *gpc = ggrid + (long)(t * 3 + p) * planeHWC + c;
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const float val = other * tp.w[k];
+                if (val != 0.f) atomicAdd(&gpc[tp.off[k]], val);
+            }
+            dgx[p] += other * dsdix[p];
+            dgy[p] += other * dsdiy[p];
+        }
+    }
+
+#pragma unroll
+    for (int p = 0; p < 3; ++p) {
+        for (int off = 1; off < CW; off <<= 1) {
+            const float ox = __shfl_down_sync(0xffffffffu, dgx[p], off);
+            const float oy = __shfl_down_sync(0xffffffffu, dgy[p], off);
+            if (lis + off < CW) {
+                dgx[p] += ox;
+                dgy[p] += oy;
+            }
+        }
+    }
+
+    if (active && segment_has_nonzero && lis == 0) {
+        const Tap t0 = make_tap(gxs[0], gys[0], H, W, C);
+        const Tap t1 = make_tap(gxs[1], gys[1], H, W, C);
+        const Tap t2 = make_tap(gxs[2], gys[2], H, W, C);
+        const float drx = dgx[0] * t0.gxm + dgy[1] * t1.gym;
+        const float dry = dgy[0] * t0.gym + dgx[2] * t2.gxm;
+        const float drz = dgx[1] * t1.gxm + dgy[2] * t2.gym;
+
+        float *sg = sgR + t * 9;
+        atomicAdd(&sg[0], drx * px);
+        atomicAdd(&sg[1], drx * py);
+        atomicAdd(&sg[2], drx * pz);
+        atomicAdd(&sg[3], dry * px);
+        atomicAdd(&sg[4], dry * py);
+        atomicAdd(&sg[5], dry * pz);
+        atomicAdd(&sg[6], drz * px);
+        atomicAdd(&sg[7], drz * py);
+        atomicAdd(&sg[8], drz * pz);
+
+        atomicAdd(&gpts[3 * b], Rt[0] * drx + Rt[3] * dry + Rt[6] * drz);
+        atomicAdd(&gpts[3 * b + 1], Rt[1] * drx + Rt[4] * dry + Rt[7] * drz);
+        atomicAdd(&gpts[3 * b + 2], Rt[2] * drx + Rt[5] * dry + Rt[8] * drz);
+    }
+
+    __syncthreads();
+    for (int i = threadIdx.x; i < T * 9; i += blockDim.x) {
+        if (sgR[i] != 0.f) atomicAdd(&gR[i], sgR[i]);
+    }
+}
+
 constexpr int kThreads = 256;
 
 inline int n_blocks(long n) { return (int)((n + kThreads - 1) / kThreads); }
+
+inline int kplanes_tilted_bwd_variant() {
+    static const int variant = [] {
+        const char *value = std::getenv("QUANTEM_KPLANES_BWD_VARIANT");
+        if (value != nullptr && value[0] == '3' && value[1] == '\0') return 3;
+        if (value != nullptr && value[0] == '4' && value[1] == '\0') return 4;
+        return 0;
+    }();
+    return variant;
+}
 
 } // namespace
 
 void kplanes_tilted_fuse_cuda(
     const float *d_pts,
     const float *d_R,
-    const float *d_grid,
+    const void *d_grid,
     float *d_out,
     long B, int T, int C, int H, int W,
+    bool grid_is_bf16,
     cudaStream_t stream
 ) {
     if (B == 0) return;
     const size_t shmem = (size_t)T * 9 * sizeof(float);
-    kplanes_tilted_fwd_kernel<<<n_blocks(B * (long)(T * C)), kThreads, shmem, stream>>>(
-        d_pts, d_R, d_grid, d_out, B, T, C, H, W);
+    if (grid_is_bf16) {
+        kplanes_tilted_fwd_bf16_kernel<<<
+            n_blocks(B * (long)(T * C)), kThreads, shmem, stream>>>(
+            d_pts, d_R, static_cast<const __nv_bfloat16 *>(d_grid),
+            d_out, B, T, C, H, W);
+    } else {
+        kplanes_tilted_fwd_kernel<<<n_blocks(B * (long)(T * C)), kThreads, shmem, stream>>>(
+            d_pts, d_R, static_cast<const float *>(d_grid), d_out, B, T, C, H, W);
+    }
     CUDA_CHECK_KERNEL();
 }
 
 void kplanes_tilted_fuse_grad_cuda(
     const float *d_pts,
     const float *d_R,
-    const float *d_grid,
+    const void *d_grid,
     const float *d_gout,
     float *d_ggrid,
     float *d_gR,
     float *d_gpts,
     long B, int T, int C, int H, int W,
+    bool grid_is_bf16,
     cudaStream_t stream
 ) {
     if (B == 0) return;
@@ -321,8 +541,37 @@ void kplanes_tilted_fuse_grad_cuda(
         n_warps = B * (long)T * ((C + 31) >> 5);
     }
     const size_t shmem = (size_t)T * 18 * sizeof(float);
-    kplanes_tilted_bwd_kernel<<<n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
-        d_pts, d_R, d_grid, d_gout, d_ggrid, d_gR, d_gpts, B, T, C, H, W);
+    const int variant = kplanes_tilted_bwd_variant();
+    if (grid_is_bf16 && variant != 4) {
+        throw std::invalid_argument(
+            "bf16 kplanes grid requires QUANTEM_KPLANES_BWD_VARIANT=4 at process startup");
+    }
+    switch (variant) {
+    case 3:
+        kplanes_tilted_bwd_earlyout_kernel<float><<<
+            n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
+            d_pts, d_R, static_cast<const float *>(d_grid), d_gout,
+            d_ggrid, d_gR, d_gpts, B, T, C, H, W);
+        break;
+    case 4:
+        if (grid_is_bf16) {
+            kplanes_tilted_bwd_earlyout_kernel<__nv_bfloat16><<<
+                n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
+                d_pts, d_R, static_cast<const __nv_bfloat16 *>(d_grid), d_gout,
+                d_ggrid, d_gR, d_gpts, B, T, C, H, W);
+        } else {
+            kplanes_tilted_bwd_earlyout_kernel<float><<<
+                n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
+                d_pts, d_R, static_cast<const float *>(d_grid), d_gout,
+                d_ggrid, d_gR, d_gpts, B, T, C, H, W);
+        }
+        break;
+    default:
+        kplanes_tilted_bwd_kernel<<<n_blocks(n_warps * 32), kThreads, shmem, stream>>>(
+            d_pts, d_R, static_cast<const float *>(d_grid), d_gout,
+            d_ggrid, d_gR, d_gpts, B, T, C, H, W);
+        break;
+    }
     CUDA_CHECK_KERNEL();
 }
 

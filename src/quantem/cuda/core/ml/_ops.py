@@ -10,6 +10,8 @@ torch-free; everything torch-facing happens here.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from torch import Tensor
 
@@ -51,7 +53,17 @@ def _kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tenso
     stream = torch.cuda.current_stream(p.device).cuda_stream
     with torch.cuda.device(p.device):
         _core.kplanes_tilted_fuse_cuda(
-            p.data_ptr(), r.data_ptr(), g.data_ptr(), out.data_ptr(), b, t, c, h, w, stream
+            p.data_ptr(),
+            r.data_ptr(),
+            g.data_ptr(),
+            out.data_ptr(),
+            b,
+            t,
+            c,
+            h,
+            w,
+            g.dtype == torch.bfloat16,
+            stream,
         )
     return out
 
@@ -74,7 +86,9 @@ def _kplanes_tilted_fuse_bwd(
     gout = grad_out.detach().to(dtype=torch.float32, device=p.device).contiguous()
     grad_pts = torch.zeros_like(p)  # accumulated across the T threads per point
     grad_r = torch.zeros_like(r)
-    grad_plane_cl = torch.zeros_like(g)
+    # V4 reads a compact bf16 plane but accumulates its gradient in a
+    # separate fp32 buffer; the scatter precision is never reduced.
+    grad_plane_cl = torch.zeros_like(g, dtype=torch.float32)
     stream = torch.cuda.current_stream(p.device).cuda_stream
     with torch.cuda.device(p.device):
         _core.kplanes_tilted_fuse_grad_cuda(
@@ -90,6 +104,7 @@ def _kplanes_tilted_fuse_bwd(
             c,
             h,
             w,
+            g.dtype == torch.bfloat16,
             stream,
         )
     # (3T, H, W, C) → (3T, C, H, W), matching the parameter layout
@@ -98,7 +113,11 @@ def _kplanes_tilted_fuse_bwd(
 
 @_kplanes_tilted_fuse_bwd.register_fake
 def _(pts: Tensor, rotations: Tensor, plane: Tensor, grad_out: Tensor) -> list[Tensor]:
-    return [torch.empty_like(pts), torch.empty_like(rotations), torch.empty_like(plane)]
+    return [
+        torch.empty_like(pts),
+        torch.empty_like(rotations),
+        torch.empty_like(plane, dtype=torch.float32),
+    ]
 
 
 def _kpt_setup_context(ctx, inputs, output) -> None:
@@ -241,7 +260,8 @@ def kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor
     Args:
         pts:       fp32 CUDA tensor ``[B, 3]``, coordinates in ``[-1, 1]``.
         rotations: fp32 CUDA tensor ``[T, 3, 3]``.
-        plane:     fp32 CUDA tensor ``[3*T, C, H, W]`` (plane ``t*3 + p``).
+        plane:     fp32 CUDA tensor ``[3*T, C, H, W]`` (plane ``t*3 + p``), or
+                   bf16 when ``QUANTEM_KPLANES_BWD_VARIANT=4``.
 
     Returns:
         fp32 tensor ``[B, T*C]`` (``out[b, t*C + c]``), differentiable.
@@ -257,11 +277,22 @@ def kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor
             "kplanes_tilted_fuse expects plane [3*T, C, H, W] with T = "
             f"rotations.shape[0]; got plane {tuple(plane.shape)} for T={rotations.shape[0]}"
         )
-    for name, t in (("pts", pts), ("rotations", rotations), ("plane", plane)):
+    for name, t in (("pts", pts), ("rotations", rotations)):
         if t.dtype != torch.float32:
             raise TypeError(f"kplanes_tilted_fuse is fp32-only ({name} is {t.dtype}).")
         if not t.is_cuda:
             raise ValueError(f"kplanes_tilted_fuse requires CUDA tensors ({name} on {t.device}).")
+    bf16_v4 = (
+        plane.dtype == torch.bfloat16 and os.environ.get("QUANTEM_KPLANES_BWD_VARIANT") == "4"
+    )
+    if plane.dtype != torch.float32 and not bf16_v4:
+        raise TypeError(
+            "kplanes_tilted_fuse is fp32-only unless "
+            "QUANTEM_KPLANES_BWD_VARIANT=4 selects a bf16 plane "
+            f"(plane is {plane.dtype})."
+        )
+    if not plane.is_cuda:
+        raise ValueError(f"kplanes_tilted_fuse requires CUDA tensors (plane on {plane.device}).")
     if plane.shape[1] * plane.shape[2] * plane.shape[3] >= 2**31:
         raise ValueError(
             "kplanes_tilted_fuse uses 32-bit per-plane offsets; "
