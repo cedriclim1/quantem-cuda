@@ -44,6 +44,7 @@ quantem-cuda = [
     "nvidia-cuda-runtime==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
     "nvidia-cuda-crt==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
     "nvidia-nvvm==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
+    "nvidia-cublas==13.0.*; sys_platform == 'linux' or sys_platform == 'win32'",
 ]
 
 [tool.scikit-build]
