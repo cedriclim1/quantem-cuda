@@ -137,9 +137,10 @@ pybind11_add_module(_core
     csrc/cuda/core/ml/kplanes_tilted.cu
     csrc/cuda/core/ml/plane_tv.cu
     csrc/cuda/core/ml/density_tail.cu
+    csrc/cuda/core/ml/cublaslt_mlp.cu
 )
 target_include_directories(_core PRIVATE csrc)
-target_link_libraries(_core PRIVATE CUDA::cudart)
+target_link_libraries(_core PRIVATE CUDA::cudart CUDA::cublasLt)
 
 # Force shared libcudart so the symbol resolves to the libcudart already
 # loaded by PyTorch at import time. This is what lets one wheel work across

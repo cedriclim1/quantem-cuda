@@ -59,6 +59,48 @@ void density_tail_grad_cuda(
     cudaStream_t stream
 );
 
+/** Three-linear sigma head with fused bias/ReLU forward epilogues.
+ *
+ * All matrix inputs and outputs are packed row-major bf16.  cuBLASLt sees
+ * their transposed column-major views, which is required because activation
+ * epilogues are not supported for CUBLASLT_ORDER_ROW.  ReLU aux buffers are
+ * packed bit matrices with leading dimensions in bits.
+ */
+void cublaslt_mlp_forward_cuda(
+    const void *x,
+    const void *w1, const void *b1,
+    const void *w2, const void *b2,
+    const void *w3, const void *b3,
+    void *h1, void *h2, void *out,
+    void *aux1, void *aux2,
+    long M, int K, int H1, int H2, int O,
+    long aux1_ld_bits, long aux2_ld_bits,
+    void *workspace, size_t workspace_bytes,
+    cudaStream_t stream
+);
+
+/** Backward for cublaslt_mlp_forward_cuda.
+ *
+ * dz1/dz2 and db1/db2 are bf16 because DRELU_BGRAD requires its bias-gradient
+ * vector to have the same dtype as D.  Weight gradients are fp32 outputs of
+ * bf16-input, fp32-accumulation cuBLASLt matmuls.
+ */
+void cublaslt_mlp_backward_cuda(
+    const void *x,
+    const void *w1, const void *w2, const void *w3,
+    const void *h1, const void *h2,
+    const void *aux1, const void *aux2,
+    const void *grad_out,
+    void *grad_x,
+    float *grad_w1, float *grad_w2, float *grad_w3,
+    void *grad_b1, void *grad_b2,
+    void *dz1, void *dz2,
+    long M, int K, int H1, int H2, int O,
+    long aux1_ld_bits, long aux2_ld_bits,
+    void *workspace, size_t workspace_bytes,
+    cudaStream_t stream
+);
+
 /* Fused TILTED K-Planes feature interpolation (one multiscale level):
  * rotate each point by T matrices, bilinearly sample the 3 planes per
  * rotation (grid_sample align_corners=True / border semantics), Hadamard-
