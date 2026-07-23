@@ -50,6 +50,285 @@ def _kplanes_ms_bf16_output_enabled() -> bool:
     )
 
 
+# ── cuBLASLt fused sigma-head MLP ──────────────────────────────────────
+
+
+def _mlp_aux_ld(width: int) -> int:
+    """Return the cuBLASLt ReLU-mask leading dimension, measured in bits."""
+    return ((width + 127) // 128) * 128
+
+
+def _mlp_workspace(device: torch.device) -> Tensor:
+    """Allocate workspace through PyTorch's stream-aware caching allocator."""
+    try:
+        workspace_mb = int(os.environ.get("QUANTEM_FUSED_MLP_WORKSPACE_MB", "32"))
+    except ValueError:
+        workspace_mb = 32
+    workspace_mb = min(1024, max(0, workspace_mb))
+    return torch.empty(workspace_mb * 1024 * 1024, dtype=torch.uint8, device=device)
+
+
+@torch.library.custom_op("quantem_cuda::cublaslt_mlp", mutates_args=())
+def _cublaslt_mlp(
+    x: Tensor,
+    w1: Tensor,
+    b1: Tensor,
+    w2: Tensor,
+    b2: Tensor,
+    w3: Tensor,
+    b3: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    m, k = x.shape
+    h1_width, h2_width, out_width = w1.shape[0], w2.shape[0], w3.shape[0]
+    h1 = torch.empty((m, h1_width), dtype=torch.bfloat16, device=x.device)
+    h2 = torch.empty((m, h2_width), dtype=torch.bfloat16, device=x.device)
+    out = torch.empty((m, out_width), dtype=torch.bfloat16, device=x.device)
+    aux1_ld = _mlp_aux_ld(h1_width)
+    aux2_ld = _mlp_aux_ld(h2_width)
+    aux1 = torch.empty((m, aux1_ld // 8), dtype=torch.uint8, device=x.device)
+    aux2 = torch.empty((m, aux2_ld // 8), dtype=torch.uint8, device=x.device)
+    workspace = _mlp_workspace(x.device)
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+    with torch.cuda.device(x.device):
+        _core.cublaslt_mlp_forward_cuda(
+            x.data_ptr(),
+            w1.data_ptr(),
+            b1.data_ptr(),
+            w2.data_ptr(),
+            b2.data_ptr(),
+            w3.data_ptr(),
+            b3.data_ptr(),
+            h1.data_ptr(),
+            h2.data_ptr(),
+            out.data_ptr(),
+            aux1.data_ptr(),
+            aux2.data_ptr(),
+            m,
+            k,
+            h1_width,
+            h2_width,
+            out_width,
+            aux1_ld,
+            aux2_ld,
+            workspace.data_ptr(),
+            workspace.numel(),
+            stream,
+        )
+    return out, h1, h2, aux1, aux2
+
+
+@_cublaslt_mlp.register_fake
+def _(
+    x: Tensor,
+    w1: Tensor,
+    b1: Tensor,
+    w2: Tensor,
+    b2: Tensor,
+    w3: Tensor,
+    b3: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    del b1, b2, b3
+    m = x.shape[0]
+    aux1_ld = _mlp_aux_ld(w1.shape[0])
+    aux2_ld = _mlp_aux_ld(w2.shape[0])
+    return (
+        x.new_empty((m, w3.shape[0])),
+        x.new_empty((m, w1.shape[0])),
+        x.new_empty((m, w2.shape[0])),
+        torch.empty((m, aux1_ld // 8), dtype=torch.uint8, device=x.device),
+        torch.empty((m, aux2_ld // 8), dtype=torch.uint8, device=x.device),
+    )
+
+
+@torch.library.custom_op("quantem_cuda::cublaslt_mlp_bwd", mutates_args=())
+def _cublaslt_mlp_bwd(
+    x: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    w3: Tensor,
+    h1: Tensor,
+    h2: Tensor,
+    aux1: Tensor,
+    aux2: Tensor,
+    grad_out: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    grad_out = grad_out.detach().to(device=x.device, dtype=torch.bfloat16).contiguous()
+    grad_x = torch.empty_like(x, memory_format=torch.contiguous_format)
+    grad_w1 = torch.empty_like(w1, dtype=torch.float32)
+    grad_w2 = torch.empty_like(w2, dtype=torch.float32)
+    grad_w3 = torch.empty_like(w3, dtype=torch.float32)
+    # DRELU_BGRAD requires bias-grad storage to match its bf16 D matrix.
+    grad_b1 = torch.empty(w1.shape[0], dtype=torch.bfloat16, device=x.device)
+    grad_b2 = torch.empty(w2.shape[0], dtype=torch.bfloat16, device=x.device)
+    dz1 = torch.empty((x.shape[0], w1.shape[0]), dtype=torch.bfloat16, device=x.device)
+    dz2 = torch.empty((x.shape[0], w2.shape[0]), dtype=torch.bfloat16, device=x.device)
+    workspace = _mlp_workspace(x.device)
+    stream = torch.cuda.current_stream(x.device).cuda_stream
+    with torch.cuda.device(x.device):
+        _core.cublaslt_mlp_backward_cuda(
+            x.data_ptr(),
+            w1.data_ptr(),
+            w2.data_ptr(),
+            w3.data_ptr(),
+            h1.data_ptr(),
+            h2.data_ptr(),
+            aux1.data_ptr(),
+            aux2.data_ptr(),
+            grad_out.data_ptr(),
+            grad_x.data_ptr(),
+            grad_w1.data_ptr(),
+            grad_w2.data_ptr(),
+            grad_w3.data_ptr(),
+            grad_b1.data_ptr(),
+            grad_b2.data_ptr(),
+            dz1.data_ptr(),
+            dz2.data_ptr(),
+            x.shape[0],
+            x.shape[1],
+            w1.shape[0],
+            w2.shape[0],
+            w3.shape[0],
+            _mlp_aux_ld(w1.shape[0]),
+            _mlp_aux_ld(w2.shape[0]),
+            workspace.data_ptr(),
+            workspace.numel(),
+            stream,
+        )
+    return grad_x, grad_w1, grad_b1, grad_w2, grad_b2, grad_w3
+
+
+@_cublaslt_mlp_bwd.register_fake
+def _(
+    x: Tensor,
+    w1: Tensor,
+    w2: Tensor,
+    w3: Tensor,
+    h1: Tensor,
+    h2: Tensor,
+    aux1: Tensor,
+    aux2: Tensor,
+    grad_out: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    del h1, h2, aux1, aux2, grad_out
+    return (
+        torch.empty_like(x),
+        torch.empty_like(w1, dtype=torch.float32),
+        torch.empty(w1.shape[0], dtype=torch.bfloat16, device=x.device),
+        torch.empty_like(w2, dtype=torch.float32),
+        torch.empty(w2.shape[0], dtype=torch.bfloat16, device=x.device),
+        torch.empty_like(w3, dtype=torch.float32),
+    )
+
+
+class _FusedHiddenMLPFunction(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, w1, b1, w2, b2, w3, b3):
+        # Explicit copies mirror autocast's bf16 GEMM operands while keeping
+        # fp32 master parameters as the Function inputs and gradient targets.
+        tensors = tuple(
+            t.detach().to(dtype=torch.bfloat16).contiguous() for t in (x, w1, b1, w2, b2, w3, b3)
+        )
+        x_bf16, w1_bf16, b1_bf16, w2_bf16, b2_bf16, w3_bf16, b3_bf16 = tensors
+        out, h1, h2, aux1, aux2 = _cublaslt_mlp(
+            x_bf16, w1_bf16, b1_bf16, w2_bf16, b2_bf16, w3_bf16, b3_bf16
+        )
+        ctx.save_for_backward(
+            x_bf16,
+            w1_bf16,
+            w2_bf16,
+            w3_bf16,
+            h1,
+            h2,
+            aux1,
+            aux2,
+            w1,
+            b1,
+            w2,
+            b2,
+            w3,
+            b3,
+        )
+        ctx.input_dtype = x.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        (
+            x,
+            w1_bf16,
+            w2_bf16,
+            w3_bf16,
+            h1,
+            h2,
+            aux1,
+            aux2,
+            w1,
+            b1,
+            w2,
+            b2,
+            w3,
+            b3,
+        ) = ctx.saved_tensors
+        try:
+            grad_x, grad_w1, grad_b1, grad_w2, grad_b2, grad_w3 = _cublaslt_mlp_bwd(
+                x, w1_bf16, w2_bf16, w3_bf16, h1, h2, aux1, aux2, grad_out
+            )
+        except (RuntimeError, TypeError, ValueError):
+            # A device may expose the forward AUX epilogue but no compatible
+            # DRELU_BGRAD heuristic. Recompute the unchanged eager graph so an
+            # unsupported backward never breaks training after fused forward.
+            with torch.enable_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+                reference_inputs = tuple(
+                    tensor.detach().requires_grad_(True) for tensor in (x, w1, b1, w2, b2, w3, b3)
+                )
+                x_ref, w1_ref, b1_ref, w2_ref, b2_ref, w3_ref, b3_ref = reference_inputs
+                h1_ref = torch.relu(torch.nn.functional.linear(x_ref, w1_ref, b1_ref))
+                h2_ref = torch.relu(torch.nn.functional.linear(h1_ref, w2_ref, b2_ref))
+                out_ref = torch.nn.functional.linear(h2_ref, w3_ref, b3_ref)
+                return torch.autograd.grad(out_ref, reference_inputs, grad_out)
+        grad_b3 = grad_out.detach().float().sum(dim=0)
+        return (
+            grad_x.to(ctx.input_dtype),
+            grad_w1,
+            grad_b1.float(),
+            grad_w2,
+            grad_b2.float(),
+            grad_w3,
+            grad_b3,
+        )
+
+
+def fused_hidden_mlp(
+    x: Tensor,
+    w1: Tensor,
+    b1: Tensor,
+    w2: Tensor,
+    b2: Tensor,
+    w3: Tensor,
+    b3: Tensor,
+) -> Tensor:
+    """Run the full two-hidden-layer bf16 sigma head with cuBLASLt epilogues.
+
+    This is intentionally strict.  Model-side dispatch handles unsupported
+    dtype, layout, device, shape, and compilation cases by using its unchanged
+    ``nn.Sequential`` implementation.
+    """
+    tensors = (x, w1, b1, w2, b2, w3, b3)
+    if x.ndim != 2 or any(t.device != x.device or not t.is_cuda for t in tensors):
+        raise ValueError("fused_hidden_mlp requires 2-D tensors on one CUDA device")
+    if x.dtype != torch.bfloat16:
+        raise TypeError("fused_hidden_mlp requires a bf16 input")
+    if any(t.dtype != torch.float32 for t in tensors[1:]):
+        raise TypeError("fused_hidden_mlp requires fp32 master parameters")
+    if any(not t.is_contiguous() for t in tensors):
+        raise ValueError("fused_hidden_mlp requires contiguous tensors")
+    if w1.shape[1] != x.shape[1] or w2.shape[1] != w1.shape[0] or w3.shape[1] != w2.shape[0]:
+        raise ValueError("fused_hidden_mlp layer shapes do not compose")
+    if b1.shape != (w1.shape[0],) or b2.shape != (w2.shape[0],) or b3.shape != (w3.shape[0],):
+        raise ValueError("fused_hidden_mlp bias shapes do not match their weights")
+    return _FusedHiddenMLPFunction.apply(x, w1, b1, w2, b2, w3, b3)
+
+
 # ── fused trunc-exp density tail ────────────────────────────────────────
 
 

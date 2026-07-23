@@ -98,6 +98,68 @@ static void py_density_tail_grad_cuda(
     );
 }
 
+static void py_cublaslt_mlp_forward_cuda(
+    long x_ptr,
+    long w1_ptr, long b1_ptr,
+    long w2_ptr, long b2_ptr,
+    long w3_ptr, long b3_ptr,
+    long h1_ptr, long h2_ptr, long out_ptr,
+    long aux1_ptr, long aux2_ptr,
+    long M, int K, int H1, int H2, int O,
+    long aux1_ld_bits, long aux2_ld_bits,
+    long workspace_ptr, size_t workspace_bytes,
+    long stream_ptr
+) {
+    cublaslt_mlp_forward_cuda(
+        reinterpret_cast<const void *>(x_ptr),
+        reinterpret_cast<const void *>(w1_ptr), reinterpret_cast<const void *>(b1_ptr),
+        reinterpret_cast<const void *>(w2_ptr), reinterpret_cast<const void *>(b2_ptr),
+        reinterpret_cast<const void *>(w3_ptr), reinterpret_cast<const void *>(b3_ptr),
+        reinterpret_cast<void *>(h1_ptr), reinterpret_cast<void *>(h2_ptr),
+        reinterpret_cast<void *>(out_ptr),
+        reinterpret_cast<void *>(aux1_ptr), reinterpret_cast<void *>(aux2_ptr),
+        M, K, H1, H2, O, aux1_ld_bits, aux2_ld_bits,
+        reinterpret_cast<void *>(workspace_ptr), workspace_bytes, to_stream(stream_ptr)
+    );
+}
+
+static void py_cublaslt_mlp_backward_cuda(
+    long x_ptr,
+    long w1_ptr, long w2_ptr, long w3_ptr,
+    long h1_ptr, long h2_ptr,
+    long aux1_ptr, long aux2_ptr,
+    long grad_out_ptr, long grad_x_ptr,
+    long grad_w1_ptr, long grad_w2_ptr, long grad_w3_ptr,
+    long grad_b1_ptr, long grad_b2_ptr,
+    long dz1_ptr, long dz2_ptr,
+    long M, int K, int H1, int H2, int O,
+    long aux1_ld_bits, long aux2_ld_bits,
+    long workspace_ptr, size_t workspace_bytes,
+    long stream_ptr
+) {
+    cublaslt_mlp_backward_cuda(
+        reinterpret_cast<const void *>(x_ptr),
+        reinterpret_cast<const void *>(w1_ptr),
+        reinterpret_cast<const void *>(w2_ptr),
+        reinterpret_cast<const void *>(w3_ptr),
+        reinterpret_cast<const void *>(h1_ptr),
+        reinterpret_cast<const void *>(h2_ptr),
+        reinterpret_cast<const void *>(aux1_ptr),
+        reinterpret_cast<const void *>(aux2_ptr),
+        reinterpret_cast<const void *>(grad_out_ptr),
+        reinterpret_cast<void *>(grad_x_ptr),
+        reinterpret_cast<float *>(grad_w1_ptr),
+        reinterpret_cast<float *>(grad_w2_ptr),
+        reinterpret_cast<float *>(grad_w3_ptr),
+        reinterpret_cast<void *>(grad_b1_ptr),
+        reinterpret_cast<void *>(grad_b2_ptr),
+        reinterpret_cast<void *>(dz1_ptr),
+        reinterpret_cast<void *>(dz2_ptr),
+        M, K, H1, H2, O, aux1_ld_bits, aux2_ld_bits,
+        reinterpret_cast<void *>(workspace_ptr), workspace_bytes, to_stream(stream_ptr)
+    );
+}
+
 static void py_kplanes_tilted_fuse_cuda(
     long pts_ptr, long r_ptr, long grid_ptr, long out_ptr,
     long B, int T, int C, int H, int W,
@@ -276,6 +338,31 @@ void register_core_ml_ops(py::module_ &m) {
           py::arg("grad_output_stride0"), py::arg("grad_output_stride1"),
           py::arg("grad_value_stride0"), py::arg("grad_value_stride1"),
           py::arg("offset"), py::arg("is_bf16"), py::arg("stream_ptr"));
+
+    m.def("cublaslt_mlp_forward_cuda", &py_cublaslt_mlp_forward_cuda,
+          "Three-linear bf16 MLP forward with cuBLASLt BIAS+RELU_AUX epilogues.",
+          py::arg("x_ptr"),
+          py::arg("w1_ptr"), py::arg("b1_ptr"),
+          py::arg("w2_ptr"), py::arg("b2_ptr"),
+          py::arg("w3_ptr"), py::arg("b3_ptr"),
+          py::arg("h1_ptr"), py::arg("h2_ptr"), py::arg("out_ptr"),
+          py::arg("aux1_ptr"), py::arg("aux2_ptr"),
+          py::arg("M"), py::arg("K"), py::arg("H1"), py::arg("H2"), py::arg("O"),
+          py::arg("aux1_ld_bits"), py::arg("aux2_ld_bits"),
+          py::arg("workspace_ptr"), py::arg("workspace_bytes"), py::arg("stream_ptr"));
+
+    m.def("cublaslt_mlp_backward_cuda", &py_cublaslt_mlp_backward_cuda,
+          "Backward of cublaslt_mlp_forward_cuda with cross-layer DRELU+BGRAD.",
+          py::arg("x_ptr"), py::arg("w1_ptr"), py::arg("w2_ptr"), py::arg("w3_ptr"),
+          py::arg("h1_ptr"), py::arg("h2_ptr"),
+          py::arg("aux1_ptr"), py::arg("aux2_ptr"),
+          py::arg("grad_out_ptr"), py::arg("grad_x_ptr"),
+          py::arg("grad_w1_ptr"), py::arg("grad_w2_ptr"), py::arg("grad_w3_ptr"),
+          py::arg("grad_b1_ptr"), py::arg("grad_b2_ptr"),
+          py::arg("dz1_ptr"), py::arg("dz2_ptr"),
+          py::arg("M"), py::arg("K"), py::arg("H1"), py::arg("H2"), py::arg("O"),
+          py::arg("aux1_ld_bits"), py::arg("aux2_ld_bits"),
+          py::arg("workspace_ptr"), py::arg("workspace_bytes"), py::arg("stream_ptr"));
 
     m.def("kplanes_tilted_fuse_cuda", &py_kplanes_tilted_fuse_cuda,
           "Fused TILTED K-Planes interpolation (one level). pts_ptr: fp32 "

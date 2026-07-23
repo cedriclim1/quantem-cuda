@@ -2,6 +2,7 @@
 
 from quantem.cuda.core.ml._ops import (
     density_tail as density_tail,
+    fused_hidden_mlp as fused_hidden_mlp,
     kplanes_tilted_fuse as kplanes_tilted_fuse,
     kplanes_tilted_fuse_ms as kplanes_tilted_fuse_ms,
     kplanes_tilted_fuse_ms_tv as kplanes_tilted_fuse_ms_tv,
