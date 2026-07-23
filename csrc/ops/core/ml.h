@@ -29,7 +29,33 @@ void plane_tv_loss_grad_cuda(
     int P0, int C0, int H0, int W0,
     int P1, int C1, int H1, int W1,
     int P2, int C2, int H2, int W2,
-    int rotations, int num_blocks,
+    int rotations, int num_blocks, bool accumulate,
+    cudaStream_t stream
+);
+
+/* Fused trunc-exp density tail. Logical tensors have one or two dimensions;
+ * explicit element strides support non-contiguous views. The forward computes
+ * exp(values - offset); backward computes grad_output * exp(min(values -
+ * offset, 15)). Input/output storage is fp32 or bf16 as selected by is_bf16. */
+void density_tail_cuda(
+    const void *d_values,
+    void *d_output,
+    long rows, long cols,
+    long value_stride0, long value_stride1,
+    long output_stride0, long output_stride1,
+    float offset, bool is_bf16,
+    cudaStream_t stream
+);
+
+void density_tail_grad_cuda(
+    const void *d_values,
+    const void *d_grad_output,
+    void *d_grad_values,
+    long rows, long cols,
+    long value_stride0, long value_stride1,
+    long grad_output_stride0, long grad_output_stride1,
+    long grad_value_stride0, long grad_value_stride1,
+    float offset, bool is_bf16,
     cudaStream_t stream
 );
 

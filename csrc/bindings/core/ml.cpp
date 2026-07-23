@@ -43,7 +43,7 @@ static void py_plane_tv_loss_grad_cuda(
     int P0, int C0, int H0, int W0,
     int P1, int C1, int H1, int W1,
     int P2, int C2, int H2, int W2,
-    int rotations, int num_blocks,
+    int rotations, int num_blocks, bool accumulate,
     long stream_ptr
 ) {
     plane_tv_loss_grad_cuda(
@@ -55,7 +55,46 @@ static void py_plane_tv_loss_grad_cuda(
         reinterpret_cast<float *>(grad_grid1_ptr),
         reinterpret_cast<float *>(grad_grid2_ptr),
         P0, C0, H0, W0, P1, C1, H1, W1, P2, C2, H2, W2,
-        rotations, num_blocks, to_stream(stream_ptr)
+        rotations, num_blocks, accumulate, to_stream(stream_ptr)
+    );
+}
+
+static void py_density_tail_cuda(
+    long values_ptr, long output_ptr,
+    long rows, long cols,
+    long value_stride0, long value_stride1,
+    long output_stride0, long output_stride1,
+    float offset, bool is_bf16,
+    long stream_ptr
+) {
+    density_tail_cuda(
+        reinterpret_cast<const void *>(values_ptr),
+        reinterpret_cast<void *>(output_ptr),
+        rows, cols,
+        value_stride0, value_stride1,
+        output_stride0, output_stride1,
+        offset, is_bf16, to_stream(stream_ptr)
+    );
+}
+
+static void py_density_tail_grad_cuda(
+    long values_ptr, long grad_output_ptr, long grad_values_ptr,
+    long rows, long cols,
+    long value_stride0, long value_stride1,
+    long grad_output_stride0, long grad_output_stride1,
+    long grad_value_stride0, long grad_value_stride1,
+    float offset, bool is_bf16,
+    long stream_ptr
+) {
+    density_tail_grad_cuda(
+        reinterpret_cast<const void *>(values_ptr),
+        reinterpret_cast<const void *>(grad_output_ptr),
+        reinterpret_cast<void *>(grad_values_ptr),
+        rows, cols,
+        value_stride0, value_stride1,
+        grad_output_stride0, grad_output_stride1,
+        grad_value_stride0, grad_value_stride1,
+        offset, is_bf16, to_stream(stream_ptr)
     );
 }
 
@@ -210,7 +249,7 @@ void register_core_ml_ops(py::module_ &m) {
           py::arg("rotations"), py::arg("num_blocks"), py::arg("stream_ptr"));
 
     m.def("plane_tv_loss_grad_cuda", &py_plane_tv_loss_grad_cuda,
-          "Analytic backward of plane_tv_loss; fully writes three fp32 gradients.",
+          "Analytic backward of plane_tv_loss; writes or accumulates three fp32 gradients.",
           py::arg("grid0_ptr"), py::arg("grid1_ptr"), py::arg("grid2_ptr"),
           py::arg("grad_output_ptr"),
           py::arg("grad_grid0_ptr"), py::arg("grad_grid1_ptr"),
@@ -218,7 +257,25 @@ void register_core_ml_ops(py::module_ &m) {
           py::arg("P0"), py::arg("C0"), py::arg("H0"), py::arg("W0"),
           py::arg("P1"), py::arg("C1"), py::arg("H1"), py::arg("W1"),
           py::arg("P2"), py::arg("C2"), py::arg("H2"), py::arg("W2"),
-          py::arg("rotations"), py::arg("num_blocks"), py::arg("stream_ptr"));
+          py::arg("rotations"), py::arg("num_blocks"), py::arg("accumulate"),
+          py::arg("stream_ptr"));
+
+    m.def("density_tail_cuda", &py_density_tail_cuda,
+          "Fused fp32/bf16 exp(values - offset) with explicit 1-D/2-D strides.",
+          py::arg("values_ptr"), py::arg("output_ptr"),
+          py::arg("rows"), py::arg("cols"),
+          py::arg("value_stride0"), py::arg("value_stride1"),
+          py::arg("output_stride0"), py::arg("output_stride1"),
+          py::arg("offset"), py::arg("is_bf16"), py::arg("stream_ptr"));
+
+    m.def("density_tail_grad_cuda", &py_density_tail_grad_cuda,
+          "Fused trunc-exp backward with explicit 1-D/2-D strides.",
+          py::arg("values_ptr"), py::arg("grad_output_ptr"),
+          py::arg("grad_values_ptr"), py::arg("rows"), py::arg("cols"),
+          py::arg("value_stride0"), py::arg("value_stride1"),
+          py::arg("grad_output_stride0"), py::arg("grad_output_stride1"),
+          py::arg("grad_value_stride0"), py::arg("grad_value_stride1"),
+          py::arg("offset"), py::arg("is_bf16"), py::arg("stream_ptr"));
 
     m.def("kplanes_tilted_fuse_cuda", &py_kplanes_tilted_fuse_cuda,
           "Fused TILTED K-Planes interpolation (one level). pts_ptr: fp32 "

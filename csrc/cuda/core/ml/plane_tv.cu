@@ -135,6 +135,7 @@ __global__ void plane_tv_finalize_kernel(
     }
 }
 
+template <bool Accumulate>
 __global__ void plane_tv_grad_kernel(
     const float *__restrict__ grid0,
     const float *__restrict__ grid1,
@@ -180,7 +181,11 @@ __global__ void plane_tv_grad_kernel(
         if (w > 0) grad += (value - grid[index - C]) * scale_w;
         if (w + 1 < W) grad += (value - grid[index + C]) * scale_w;
 
-        grad_grid[index] = grad;
+        if constexpr (Accumulate) {
+            grad_grid[index] += grad;
+        } else {
+            grad_grid[index] = grad;
+        }
     }
 }
 
@@ -217,15 +222,24 @@ void plane_tv_loss_grad_cuda(
     int P0, int C0, int H0, int W0,
     int P1, int C1, int H1, int W1,
     int P2, int C2, int H2, int W2,
-    int rotations, int num_blocks,
+    int rotations, int num_blocks, bool accumulate,
     cudaStream_t stream
 ) {
     dim3 grid(num_blocks, 3, 1);
-    plane_tv_grad_kernel<<<grid, kBlockSize, 0, stream>>>(
-        d_grid0, d_grid1, d_grid2, d_grad_output,
-        d_grad_grid0, d_grad_grid1, d_grad_grid2,
-        P0, C0, H0, W0, P1, C1, H1, W1, P2, C2, H2, W2,
-        rotations
-    );
+    if (accumulate) {
+        plane_tv_grad_kernel<true><<<grid, kBlockSize, 0, stream>>>(
+            d_grid0, d_grid1, d_grid2, d_grad_output,
+            d_grad_grid0, d_grad_grid1, d_grad_grid2,
+            P0, C0, H0, W0, P1, C1, H1, W1, P2, C2, H2, W2,
+            rotations
+        );
+    } else {
+        plane_tv_grad_kernel<false><<<grid, kBlockSize, 0, stream>>>(
+            d_grid0, d_grid1, d_grid2, d_grad_output,
+            d_grad_grid0, d_grad_grid1, d_grad_grid2,
+            P0, C0, H0, W0, P1, C1, H1, W1, P2, C2, H2, W2,
+            rotations
+        );
+    }
     CUDA_CHECK_KERNEL();
 }

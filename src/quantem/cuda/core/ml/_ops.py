@@ -50,6 +50,93 @@ def _kplanes_ms_bf16_output_enabled() -> bool:
     )
 
 
+# ── fused trunc-exp density tail ────────────────────────────────────────
+
+
+def _density_tail_shape_strides(tensor: Tensor) -> tuple[int, int, int, int]:
+    if tensor.ndim == 1:
+        return tensor.shape[0], 1, tensor.stride(0), 0
+    return tensor.shape[0], tensor.shape[1], tensor.stride(0), tensor.stride(1)
+
+
+@torch.library.custom_op("quantem_cuda::density_tail", mutates_args=())
+def _density_tail(values: Tensor, offset: float) -> Tensor:
+    output = torch.empty_like(values, memory_format=torch.contiguous_format)
+    rows, cols, value_stride0, value_stride1 = _density_tail_shape_strides(values)
+    _, _, output_stride0, output_stride1 = _density_tail_shape_strides(output)
+    stream = torch.cuda.current_stream(values.device).cuda_stream
+    with torch.cuda.device(values.device):
+        _core.density_tail_cuda(
+            values.data_ptr(),
+            output.data_ptr(),
+            rows,
+            cols,
+            value_stride0,
+            value_stride1,
+            output_stride0,
+            output_stride1,
+            float(offset),
+            values.dtype == torch.bfloat16,
+            stream,
+        )
+    return output
+
+
+@_density_tail.register_fake
+def _(values: Tensor, offset: float) -> Tensor:
+    del offset
+    return torch.empty_like(values, memory_format=torch.contiguous_format)
+
+
+@torch.library.custom_op("quantem_cuda::density_tail_bwd", mutates_args=())
+def _density_tail_bwd(values: Tensor, grad_out: Tensor, offset: float) -> Tensor:
+    grad_out = grad_out.detach().to(device=values.device, dtype=values.dtype)
+    grad_values = torch.empty_like(values, memory_format=torch.contiguous_format)
+    rows, cols, value_stride0, value_stride1 = _density_tail_shape_strides(values)
+    _, _, gout_stride0, gout_stride1 = _density_tail_shape_strides(grad_out)
+    _, _, grad_stride0, grad_stride1 = _density_tail_shape_strides(grad_values)
+    stream = torch.cuda.current_stream(values.device).cuda_stream
+    with torch.cuda.device(values.device):
+        _core.density_tail_grad_cuda(
+            values.data_ptr(),
+            grad_out.data_ptr(),
+            grad_values.data_ptr(),
+            rows,
+            cols,
+            value_stride0,
+            value_stride1,
+            gout_stride0,
+            gout_stride1,
+            grad_stride0,
+            grad_stride1,
+            float(offset),
+            values.dtype == torch.bfloat16,
+            stream,
+        )
+    return grad_values
+
+
+@_density_tail_bwd.register_fake
+def _(values: Tensor, grad_out: Tensor, offset: float) -> Tensor:
+    del grad_out, offset
+    return torch.empty_like(values, memory_format=torch.contiguous_format)
+
+
+def _density_tail_setup_context(ctx, inputs, output) -> None:
+    del output
+    values, offset = inputs
+    ctx.save_for_backward(values)
+    ctx.offset = offset
+
+
+def _density_tail_backward(ctx, grad_out):
+    (values,) = ctx.saved_tensors
+    return _density_tail_bwd(values, grad_out, ctx.offset), None
+
+
+_density_tail.register_autograd(_density_tail_backward, setup_context=_density_tail_setup_context)
+
+
 # ── three-level plane-wise 2-D squared TV ───────────────────────────────
 
 
@@ -110,6 +197,7 @@ def _plane_tv_loss_bwd(
             *dims,
             rotations,
             num_blocks,
+            False,
             stream,
         )
     return [
@@ -398,6 +486,201 @@ def _kpt_ms_backward(ctx, grad_out):
 _kplanes_tilted_fuse_ms.register_autograd(_kpt_ms_backward, setup_context=_kpt_ms_setup_context)
 
 
+# ── optional multiscale interpolation + plane-TV autograd path ──────────
+
+
+@torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse_ms_tv", mutates_args=())
+def _kplanes_tilted_fuse_ms_tv(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    scale0: float,
+    scale1: float,
+    scale2: float,
+    output_is_bf16: bool,
+) -> tuple[Tensor, Tensor]:
+    p = pts.contiguous()
+    r = rotations.contiguous()
+    planes = (plane0, plane1, plane2)
+    grids = tuple(_channels_last(plane) for plane in planes)
+    dims = tuple(dim for plane in planes for dim in plane.shape[1:])
+    tv_dims = tuple(dim for plane in planes for dim in plane.shape)
+    b = p.shape[0]
+    t = r.shape[0]
+    out_width = t * sum(plane.shape[1] for plane in planes)
+    out_dtype = torch.bfloat16 if output_is_bf16 else torch.float32
+    out = torch.empty((b, out_width), dtype=out_dtype, device=p.device)
+    num_blocks = _plane_tv_num_blocks(grids)
+    partials = torch.empty((3 * num_blocks,), dtype=torch.float32, device=p.device)
+    tv = torch.empty((), dtype=torch.float32, device=p.device)
+    stream = torch.cuda.current_stream(p.device).cuda_stream
+    with torch.cuda.device(p.device):
+        _core.kplanes_tilted_fuse_ms_cuda(
+            p.data_ptr(),
+            r.data_ptr(),
+            *(grid.data_ptr() for grid in grids),
+            out.data_ptr(),
+            b,
+            t,
+            *dims,
+            scale0,
+            scale1,
+            scale2,
+            False,
+            output_is_bf16,
+            stream,
+        )
+        _core.plane_tv_loss_cuda(
+            *(grid.data_ptr() for grid in grids),
+            partials.data_ptr(),
+            tv.data_ptr(),
+            *tv_dims,
+            t,
+            num_blocks,
+            stream,
+        )
+    return out, tv
+
+
+@_kplanes_tilted_fuse_ms_tv.register_fake
+def _(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    scale0: float,
+    scale1: float,
+    scale2: float,
+    output_is_bf16: bool,
+) -> tuple[Tensor, Tensor]:
+    del scale0, scale1, scale2
+    width = rotations.shape[0] * (plane0.shape[1] + plane1.shape[1] + plane2.shape[1])
+    dtype = torch.bfloat16 if output_is_bf16 else torch.float32
+    return pts.new_empty((pts.shape[0], width), dtype=dtype), plane0.new_empty(())
+
+
+@torch.library.custom_op("quantem_cuda::kplanes_tilted_fuse_ms_tv_bwd", mutates_args=())
+def _kplanes_tilted_fuse_ms_tv_bwd(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    grad_out: Tensor,
+    grad_tv: Tensor,
+    scale0: float,
+    scale1: float,
+    scale2: float,
+) -> list[Tensor]:
+    p = pts.contiguous()
+    r = rotations.contiguous()
+    planes = (plane0, plane1, plane2)
+    grids = tuple(_channels_last(plane) for plane in planes)
+    dims = tuple(dim for plane in planes for dim in plane.shape[1:])
+    tv_dims = tuple(dim for plane in planes for dim in plane.shape)
+    b = p.shape[0]
+    t = r.shape[0]
+    gout = grad_out.detach().to(device=p.device)
+    if gout.dtype not in (torch.float32, torch.bfloat16):
+        gout = gout.float()
+    if gout.stride(1) != 1:
+        gout = gout.contiguous()
+    tv_gout = grad_tv.detach().to(dtype=torch.float32, device=p.device).reshape(1).contiguous()
+    grad_pts = torch.zeros_like(p)
+    grad_r = torch.zeros_like(r)
+    grad_grids = tuple(torch.zeros_like(grid, dtype=torch.float32) for grid in grids)
+    num_blocks = _plane_tv_num_blocks(grids)
+    stream = torch.cuda.current_stream(p.device).cuda_stream
+    with torch.cuda.device(p.device):
+        _core.kplanes_tilted_fuse_ms_grad_cuda(
+            p.data_ptr(),
+            r.data_ptr(),
+            *(grid.data_ptr() for grid in grids),
+            gout.data_ptr(),
+            *(grad_grid.data_ptr() for grad_grid in grad_grids),
+            grad_r.data_ptr(),
+            grad_pts.data_ptr(),
+            b,
+            t,
+            *dims,
+            gout.stride(0),
+            scale0,
+            scale1,
+            scale2,
+            False,
+            gout.dtype == torch.bfloat16,
+            stream,
+        )
+        _core.plane_tv_loss_grad_cuda(
+            *(grid.data_ptr() for grid in grids),
+            tv_gout.data_ptr(),
+            *(grad_grid.data_ptr() for grad_grid in grad_grids),
+            *tv_dims,
+            t,
+            num_blocks,
+            True,
+            stream,
+        )
+    restored = tuple(
+        _restore_plane_layout(grad_grid, plane) for grad_grid, plane in zip(grad_grids, planes)
+    )
+    return [grad_pts, grad_r, *restored]
+
+
+@_kplanes_tilted_fuse_ms_tv_bwd.register_fake
+def _(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    grad_out: Tensor,
+    grad_tv: Tensor,
+    scale0: float,
+    scale1: float,
+    scale2: float,
+) -> list[Tensor]:
+    del grad_out, grad_tv, scale0, scale1, scale2
+    return [
+        torch.empty_like(pts),
+        torch.empty_like(rotations),
+        torch.empty_like(plane0, dtype=torch.float32),
+        torch.empty_like(plane1, dtype=torch.float32),
+        torch.empty_like(plane2, dtype=torch.float32),
+    ]
+
+
+def _kpt_ms_tv_setup_context(ctx, inputs, output) -> None:
+    del output
+    pts, rotations, plane0, plane1, plane2, scale0, scale1, scale2, output_is_bf16 = inputs
+    del output_is_bf16
+    ctx.save_for_backward(pts, rotations, plane0, plane1, plane2)
+    ctx.scales = (scale0, scale1, scale2)
+
+
+def _kpt_ms_tv_backward(ctx, grad_out, grad_tv):
+    pts, rotations, plane0, plane1, plane2 = ctx.saved_tensors
+    grads = _kplanes_tilted_fuse_ms_tv_bwd(
+        pts,
+        rotations,
+        plane0,
+        plane1,
+        plane2,
+        grad_out,
+        grad_tv,
+        *ctx.scales,
+    )
+    return *grads, None, None, None, None
+
+
+_kplanes_tilted_fuse_ms_tv.register_autograd(
+    _kpt_ms_tv_backward, setup_context=_kpt_ms_tv_setup_context
+)
+
+
 # ── TV-specialized fused TILTED K-Planes interpolation ───────────────────
 #
 # kplanes_tilted_tv_fuse evaluates kplanes_tilted_fuse at 4 tap locations:
@@ -502,6 +785,26 @@ _kplanes_tilted_tv_fuse.register_autograd(_kpt_tv_backward, setup_context=_kpt_t
 
 
 # ── public wrappers ───────────────────────────────────────────────────────
+
+
+def density_tail(values: Tensor, offset: float = 0.0) -> Tensor:
+    """Fused ``exp(values - offset)`` with a trunc-exp backward.
+
+    Supports non-empty fp32/bf16 CUDA vectors and matrices. Inputs may be
+    strided; the result is dense and has the same shape and dtype.
+    """
+    name = "density_tail"
+    if values.ndim not in (1, 2):
+        raise ValueError(f"{name} expects a 1-D or 2-D tensor, got {tuple(values.shape)}")
+    if values.numel() == 0:
+        raise ValueError(f"{name} requires a non-empty tensor")
+    if values.dtype not in (torch.float32, torch.bfloat16):
+        raise TypeError(f"{name} supports fp32 and bf16 (values are {values.dtype}).")
+    if not values.is_cuda:
+        raise ValueError(f"{name} requires a CUDA tensor (values on {values.device}).")
+    if any(stride < 0 for stride in values.stride()):
+        raise ValueError(f"{name} does not support negative strides")
+    return _density_tail(values, float(offset))
 
 
 def plane_tv_loss(plane0: Tensor, plane1: Tensor, plane2: Tensor) -> Tensor:
@@ -672,6 +975,66 @@ def kplanes_tilted_fuse_ms(
     if rotations.device != pts.device:
         raise ValueError(f"{name} requires rotations on {pts.device} (got {rotations.device}).")
     return _kplanes_tilted_fuse_ms(
+        pts,
+        rotations,
+        plane0,
+        plane1,
+        plane2,
+        float(scale0),
+        float(scale1),
+        float(scale2),
+        _kplanes_ms_bf16_output_enabled(),
+    )
+
+
+def kplanes_tilted_fuse_ms_tv(
+    pts: Tensor,
+    rotations: Tensor,
+    plane0: Tensor,
+    plane1: Tensor,
+    plane2: Tensor,
+    scale0: float = 1.0,
+    scale1: float = 1.0,
+    scale2: float = 1.0,
+) -> tuple[Tensor, Tensor]:
+    """Return multiscale features and raw plane-TV through one autograd node.
+
+    The forward reuses the existing multiscale and plane-TV launchers. During
+    backward, plane-TV accumulates directly into the multiscale op's three
+    dense fp32 grid-gradient buffers, eliminating separate TV gradients and
+    the three autograd add passes. This experimental path is fp32-grid only.
+    """
+    name = "kplanes_tilted_fuse_ms_tv"
+    if pts.ndim != 2 or pts.shape[-1] != 3:
+        raise ValueError(f"{name} expects pts [B, 3], got {tuple(pts.shape)}")
+    if rotations.ndim != 3 or rotations.shape[-2:] != (3, 3):
+        raise ValueError(f"{name} expects rotations [T, 3, 3], got {tuple(rotations.shape)}")
+    planes = (plane0, plane1, plane2)
+    for level, plane in enumerate(planes):
+        if plane.ndim != 4 or plane.shape[0] != 3 * rotations.shape[0]:
+            raise ValueError(
+                f"{name} expects plane{level} [3*T, C, H, W]; got "
+                f"{tuple(plane.shape)} for T={rotations.shape[0]}"
+            )
+        if plane.shape[1] * plane.shape[2] * plane.shape[3] >= 2**31:
+            raise ValueError(
+                f"{name} uses 32-bit per-plane offsets; C*H*W must be < 2^31, "
+                f"got plane{level} {tuple(plane.shape)}"
+            )
+        if any(dim == 0 for dim in plane.shape[1:]):
+            raise ValueError(f"{name} requires non-empty C/H/W dimensions")
+    for tensor_name, tensor in (
+        ("pts", pts),
+        ("rotations", rotations),
+        *[(f"plane{i}", p) for i, p in enumerate(planes)],
+    ):
+        if tensor.dtype != torch.float32:
+            raise TypeError(f"{name} is fp32-grid only ({tensor_name} is {tensor.dtype}).")
+        if not tensor.is_cuda or tensor.device != pts.device:
+            raise ValueError(
+                f"{name} requires {tensor_name} on {pts.device} (got {tensor.device})."
+            )
+    return _kplanes_tilted_fuse_ms_tv(
         pts,
         rotations,
         plane0,

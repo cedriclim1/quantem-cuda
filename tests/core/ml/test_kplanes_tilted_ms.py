@@ -8,7 +8,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from quantem.cuda.core.ml import kplanes_tilted_fuse, kplanes_tilted_fuse_ms
+from quantem.cuda.core.ml import (
+    kplanes_tilted_fuse,
+    kplanes_tilted_fuse_ms,
+    kplanes_tilted_fuse_ms_tv,
+    plane_tv_loss,
+)
 from quantem.cuda.core.ml._ops import _kplanes_tilted_fuse_ms_bwd
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA device")
@@ -119,6 +124,41 @@ def test_ms_forward_matches_concatenated_levels():
     actual = _multiscale(pts, rotations, *grids)
     assert actual.shape == expected.shape
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+@requires_cuda
+def test_ms_plane_tv_combined_path_matches_separate_ops_and_weight_once():
+    # One point avoids nondeterministic atomic collisions in the interpolation
+    # gradient, allowing the requested tight grid-gradient comparison.
+    pts, rotations, grids = _inputs(requires_grad=False, seed=17)
+    pts = pts[:1]
+    separate_inputs = tuple(
+        tensor.detach().clone().requires_grad_(True) for tensor in (pts, rotations, *grids)
+    )
+    combined_inputs = tuple(
+        tensor.detach().clone().requires_grad_(True) for tensor in (pts, rotations, *grids)
+    )
+    weight = torch.tensor(0.0375, device="cuda", dtype=torch.float32)
+
+    separate_features = _multiscale(*separate_inputs)
+    separate_tv = plane_tv_loss(*separate_inputs[2:])
+    combined_features, combined_tv = kplanes_tilted_fuse_ms_tv(*combined_inputs, *GATES)
+
+    assert torch.equal(combined_features, separate_features)
+    torch.testing.assert_close(combined_tv, separate_tv, rtol=2e-6, atol=2e-7)
+    upstream = torch.linspace(
+        -0.25, 0.75, separate_features.numel(), device="cuda", dtype=separate_features.dtype
+    ).reshape_as(separate_features)
+    separate_loss = (separate_features * upstream).sum() + weight * separate_tv
+    combined_loss = (combined_features * upstream).sum() + weight * combined_tv
+    torch.testing.assert_close(combined_loss, separate_loss, rtol=2e-6, atol=2e-7)
+
+    separate_grads = torch.autograd.grad(separate_loss, separate_inputs)
+    combined_grads = torch.autograd.grad(combined_loss, combined_inputs)
+    for actual, expected in zip(combined_grads[2:], separate_grads[2:]):
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    for actual, expected in zip(combined_grads[:2], separate_grads[:2]):
+        torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
 
 
 @requires_cuda
@@ -352,6 +392,21 @@ def test_ms_compile_fullgraph():
     @torch.compile(fullgraph=True)
     def compiled(p, r, g0, g1, g2):
         return kplanes_tilted_fuse_ms(p, r, g0, g1, g2, *GATES).square().mean()
+
+    loss = compiled(pts, rotations, *grids)
+    loss.backward()
+    for tensor in (pts, rotations, *grids):
+        assert tensor.grad is not None
+
+
+@requires_cuda
+def test_ms_plane_tv_combined_compile_fullgraph():
+    pts, rotations, grids = _inputs(requires_grad=True, seed=19)
+
+    @torch.compile(fullgraph=True)
+    def compiled(p, r, g0, g1, g2):
+        features, tv = kplanes_tilted_fuse_ms_tv(p, r, g0, g1, g2, *GATES)
+        return features.square().mean() + 0.0375 * tv
 
     loss = compiled(pts, rotations, *grids)
     loss.backward()
