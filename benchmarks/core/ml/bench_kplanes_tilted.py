@@ -4,6 +4,8 @@ Configs mirror quantem tomography DIP/INR workloads: B = batch_rays x
 samples_per_ray points per training batch.
 """
 
+import os
+
 import torch
 import torch.nn.functional as F
 
@@ -27,7 +29,7 @@ def reference(pts, rotations, plane):
         rotated.unsqueeze(1).expand(T, 3, B, 3).gather(-1, idx.view(1, 3, 1, 2).expand(T, 3, B, 2))
     )
     sampled = F.grid_sample(
-        plane,
+        plane.float(),
         coords.reshape(3 * T, B, 1, 2),
         align_corners=True,
         mode="bilinear",
@@ -64,7 +66,10 @@ def ray_points(B, dev, samples_per_ray=200):
 def main():
     assert torch.cuda.is_available()
     dev = torch.device("cuda")
+    variant = os.environ.get("QUANTEM_KPLANES_BWD_VARIANT", "5")
+    plane_dtype = torch.bfloat16 if variant == "4" else torch.float32
     print(f"device: {torch.cuda.get_device_name(dev)}\n")
+    print(f"backward variant: {variant}; plane dtype: {plane_dtype}\n")
     print(f"{'config':<44s} {'op':<9s} {'torch':>9s} {'fused':>9s} {'speedup':>8s}")
 
     for label, B, T, C, H, W in CONFIGS:
@@ -73,7 +78,11 @@ def main():
         else:
             pts = (torch.rand(B, 3, device=dev) * 2 - 1).requires_grad_(True)
         rotations = torch.randn(T, 3, 3, device=dev).requires_grad_(True)
-        plane = torch.empty(3 * T, C, H, W, device=dev).uniform_(0.1, 0.5).requires_grad_(True)
+        plane = (
+            torch.empty(3 * T, C, H, W, device=dev, dtype=plane_dtype)
+            .uniform_(0.1, 0.5)
+            .requires_grad_(True)
+        )
         upstream = torch.randn(B, T * C, device=dev)
 
         def fwd(fn):

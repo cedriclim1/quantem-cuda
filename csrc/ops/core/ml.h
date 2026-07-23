@@ -8,34 +8,176 @@
 
 #include <cuda_runtime.h>
 
+/* Three-level plane-wise 2-D squared-TV loss. Grids are fp32 channels-last
+ * [3*T,H,W,C]. Forward writes one scalar after applying each plane's distinct
+ * H/W mean denominator and averaging over T. Backward fully writes all three
+ * fp32 gradient grids. */
+void plane_tv_loss_cuda(
+    const float *d_grid0, const float *d_grid1, const float *d_grid2,
+    float *d_partials, float *d_output,
+    int P0, int C0, int H0, int W0,
+    int P1, int C1, int H1, int W1,
+    int P2, int C2, int H2, int W2,
+    int rotations, int num_blocks,
+    cudaStream_t stream
+);
+
+void plane_tv_loss_grad_cuda(
+    const float *d_grid0, const float *d_grid1, const float *d_grid2,
+    const float *d_grad_output,
+    float *d_grad_grid0, float *d_grad_grid1, float *d_grad_grid2,
+    int P0, int C0, int H0, int W0,
+    int P1, int C1, int H1, int W1,
+    int P2, int C2, int H2, int W2,
+    int rotations, int num_blocks, bool accumulate,
+    cudaStream_t stream
+);
+
+/* Fused trunc-exp density tail. Logical tensors have one or two dimensions;
+ * explicit element strides support non-contiguous views. The forward computes
+ * exp(values - offset); backward computes grad_output * exp(min(values -
+ * offset, 15)). Input/output storage is fp32 or bf16 as selected by is_bf16. */
+void density_tail_cuda(
+    const void *d_values,
+    void *d_output,
+    long rows, long cols,
+    long value_stride0, long value_stride1,
+    long output_stride0, long output_stride1,
+    float offset, bool is_bf16,
+    cudaStream_t stream
+);
+
+void density_tail_grad_cuda(
+    const void *d_values,
+    const void *d_grad_output,
+    void *d_grad_values,
+    long rows, long cols,
+    long value_stride0, long value_stride1,
+    long grad_output_stride0, long grad_output_stride1,
+    long grad_value_stride0, long grad_value_stride1,
+    float offset, bool is_bf16,
+    cudaStream_t stream
+);
+
+/** Three-linear sigma head with fused bias/ReLU forward epilogues.
+ *
+ * All matrix inputs and outputs are packed row-major bf16.  cuBLASLt sees
+ * their transposed column-major views, which is required because activation
+ * epilogues are not supported for CUBLASLT_ORDER_ROW.  ReLU aux buffers are
+ * packed bit matrices with leading dimensions in bits.
+ */
+void cublaslt_mlp_forward_cuda(
+    const void *x,
+    const void *w1, const void *b1,
+    const void *w2, const void *b2,
+    const void *w3, const void *b3,
+    void *h1, void *h2, void *out,
+    void *aux1, void *aux2,
+    long M, int K, int H1, int H2, int O,
+    long aux1_ld_bits, long aux2_ld_bits,
+    void *workspace, size_t workspace_bytes,
+    cudaStream_t stream
+);
+
+/** Backward for cublaslt_mlp_forward_cuda.
+ *
+ * dz1/dz2 and db1/db2 are bf16 because DRELU_BGRAD requires its bias-gradient
+ * vector to have the same dtype as D.  Weight gradients are fp32 outputs of
+ * bf16-input, fp32-accumulation cuBLASLt matmuls.
+ */
+void cublaslt_mlp_backward_cuda(
+    const void *x,
+    const void *w1, const void *w2, const void *w3,
+    const void *h1, const void *h2,
+    const void *aux1, const void *aux2,
+    const void *grad_out,
+    void *grad_x,
+    float *grad_w1, float *grad_w2, float *grad_w3,
+    void *grad_b1, void *grad_b2,
+    void *dz1, void *dz2,
+    long M, int K, int H1, int H2, int O,
+    long aux1_ld_bits, long aux2_ld_bits,
+    void *workspace, size_t workspace_bytes,
+    cudaStream_t stream
+);
+
 /* Fused TILTED K-Planes feature interpolation (one multiscale level):
  * rotate each point by T matrices, bilinearly sample the 3 planes per
  * rotation (grid_sample align_corners=True / border semantics), Hadamard-
- * multiply, write features. pts [B,3]; R [T,3,3]; grid [3T,H,W,C]
+ * multiply, write features. pts [B,3]; R [T,3,3]; grid [3T,H,W,C] fp32/bf16
  * CHANNELS-LAST with plane index t*3 + {XY, ZX, YZ}; out [B, T*C] fully
  * written. */
 void kplanes_tilted_fuse_cuda(
     const float *d_pts,
     const float *d_R,
-    const float *d_grid,
+    const void  *d_grid,
     float       *d_out,
     long B, int T, int C, int H, int W,
+    bool grid_is_bf16,
     cudaStream_t stream
 );
 
-/* Backward of the fused interpolation. gout [B, T*C]; ggrid [3T,H,W,C]
+/* Backward of the fused interpolation. gout [B, T*C]; grid may be fp32/bf16;
+ * ggrid [3T,H,W,C] is always fp32
  * (channels-last, like grid), gR [T,3,3] and gpts [B,3] are accumulated
  * into (caller pre-zeroes all three). Coordinate gradients are zeroed
  * where the border clip engaged, matching torch's grid_sampler. */
 void kplanes_tilted_fuse_grad_cuda(
     const float *d_pts,
     const float *d_R,
-    const float *d_grid,
+    const void  *d_grid,
     const float *d_gout,
     float       *d_ggrid,
     float       *d_gR,
     float       *d_gpts,
     long B, int T, int C, int H, int W,
+    bool grid_is_bf16,
+    cudaStream_t stream
+);
+
+/* Three-level multiscale interpolation. One 2-D launch partitions blocks by
+ * level (grid.y) and writes directly into one fp32/bf16
+ * [B, sum_l T*C_l] output. */
+void kplanes_tilted_fuse_ms_cuda(
+    const float *d_pts,
+    const float *d_R,
+    const void  *d_grid0,
+    const void  *d_grid1,
+    const void  *d_grid2,
+    void        *d_out,
+    long B, int T,
+    int C0, int H0, int W0,
+    int C1, int H1, int W1,
+    int C2, int H2, int W2,
+    float scale0, float scale1, float scale2,
+    bool grid_is_bf16,
+    bool output_is_bf16,
+    cudaStream_t stream
+);
+
+/* Backward of the three-level op. gout is an fp32/bf16 inner-contiguous 2-D view;
+ * gout_row_stride is its element stride between rows. The three level
+ * offsets are derived from T*C_l. Each ggrid_l is dense fp32. */
+void kplanes_tilted_fuse_ms_grad_cuda(
+    const float *d_pts,
+    const float *d_R,
+    const void  *d_grid0,
+    const void  *d_grid1,
+    const void  *d_grid2,
+    const void  *d_gout,
+    float       *d_ggrid0,
+    float       *d_ggrid1,
+    float       *d_ggrid2,
+    float       *d_gR,
+    float       *d_gpts,
+    long B, int T,
+    int C0, int H0, int W0,
+    int C1, int H1, int W1,
+    int C2, int H2, int W2,
+    long gout_row_stride,
+    float scale0, float scale1, float scale2,
+    bool grid_is_bf16,
+    bool gout_is_bf16,
     cudaStream_t stream
 );
 
