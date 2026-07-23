@@ -61,14 +61,24 @@ void set_attr(cublasLtMatmulDesc_t desc, cublasLtMatmulDescAttributes_t attr, co
 }
 
 cublasLtHandle_t handle() {
-    // cuBLASLt handles carry no stream state.  A process-lifetime handle avoids
-    // CUDA-runtime teardown ordering hazards and is safe for concurrent calls.
-    static cublasLtHandle_t value = [] {
+    int device = 0;
+    if (cudaGetDevice(&device) != cudaSuccess) {
+        throw std::runtime_error("cuBLASLt could not query the current CUDA device");
+    }
+
+    // A cuBLASLt handle becomes associated with the current device on first
+    // use. Keep one process-lifetime handle per device and intentionally leak
+    // them to avoid CUDA-runtime teardown ordering hazards.
+    static auto *handles = new std::unordered_map<int, cublasLtHandle_t>();
+    static auto *mutex = new std::mutex();
+    std::lock_guard<std::mutex> lock(*mutex);
+    auto it = handles->find(device);
+    if (it == handles->end()) {
         cublasLtHandle_t created = nullptr;
         check(cublasLtCreate(&created), "create handle");
-        return created;
-    }();
-    return value;
+        it = handles->emplace(device, created).first;
+    }
+    return it->second;
 }
 
 enum class MatmulKind : int {

@@ -11,9 +11,12 @@ torch-free; everything torch-facing happens here.
 from __future__ import annotations
 
 import os
+import threading
+import warnings
 
 import torch
 from torch import Tensor
+from torch.autograd.function import once_differentiable
 
 from quantem.cuda import _core
 
@@ -66,6 +69,42 @@ def _mlp_workspace(device: torch.device) -> Tensor:
         workspace_mb = 32
     workspace_mb = min(1024, max(0, workspace_mb))
     return torch.empty(workspace_mb * 1024 * 1024, dtype=torch.uint8, device=device)
+
+
+_MlpShapeKey = tuple[int | None, int, int, int, int, int]
+_unsupported_mlp_shapes: dict[_MlpShapeKey, str] = {}
+_warned_mlp_fallback_reasons: set[str] = set()
+_mlp_fallback_lock = threading.Lock()
+
+
+def _mlp_shape_key(x: Tensor, w1: Tensor, w2: Tensor, w3: Tensor) -> _MlpShapeKey:
+    return (
+        x.device.index,
+        x.shape[0],
+        x.shape[1],
+        w1.shape[0],
+        w2.shape[0],
+        w3.shape[0],
+    )
+
+
+def _unsupported_mlp_reason(key: _MlpShapeKey) -> str | None:
+    with _mlp_fallback_lock:
+        return _unsupported_mlp_shapes.get(key)
+
+
+def _memoize_unsupported_mlp_shape(key: _MlpShapeKey, reason: str) -> None:
+    with _mlp_fallback_lock:
+        _unsupported_mlp_shapes[key] = reason
+        should_warn = reason not in _warned_mlp_fallback_reasons
+        _warned_mlp_fallback_reasons.add(reason)
+    if should_warn:
+        warnings.warn(
+            "Fused cuBLASLt MLP backward is unsupported for this device/shape; "
+            f"future calls will use the eager path. Reason: {reason}",
+            RuntimeWarning,
+            stacklevel=3,
+        )
 
 
 @torch.library.custom_op("quantem_cuda::cublaslt_mlp", mutates_args=())
@@ -249,9 +288,11 @@ class _FusedHiddenMLPFunction(torch.autograd.Function):
             b3,
         )
         ctx.input_dtype = x.dtype
+        ctx.mlp_shape_key = _mlp_shape_key(x, w1, w2, w3)
         return out
 
     @staticmethod
+    @once_differentiable
     def backward(ctx, grad_out):
         (
             x,
@@ -273,10 +314,12 @@ class _FusedHiddenMLPFunction(torch.autograd.Function):
             grad_x, grad_w1, grad_b1, grad_w2, grad_b2, grad_w3 = _cublaslt_mlp_bwd(
                 x, w1_bf16, w2_bf16, w3_bf16, h1, h2, aux1, aux2, grad_out
             )
-        except (RuntimeError, TypeError, ValueError):
+        except (RuntimeError, TypeError, ValueError) as error:
             # A device may expose the forward AUX epilogue but no compatible
             # DRELU_BGRAD heuristic. Recompute the unchanged eager graph so an
             # unsupported backward never breaks training after fused forward.
+            reason = f"{type(error).__name__}: {error}"
+            _memoize_unsupported_mlp_shape(ctx.mlp_shape_key, reason)
             with torch.enable_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
                 reference_inputs = tuple(
                     tensor.detach().requires_grad_(True) for tensor in (x, w1, b1, w2, b2, w3, b3)
@@ -311,7 +354,9 @@ def fused_hidden_mlp(
 
     This is intentionally strict.  Model-side dispatch handles unsupported
     dtype, layout, device, shape, and compilation cases by using its unchanged
-    ``nn.Sequential`` implementation.
+    ``nn.Sequential`` implementation. This custom path is not governed by
+    ``torch.use_deterministic_algorithms``; disable it when strict PyTorch
+    deterministic-mode behavior is required.
     """
     tensors = (x, w1, b1, w2, b2, w3, b3)
     if x.ndim != 2 or any(t.device != x.device or not t.is_cuda for t in tensors):
@@ -326,6 +371,13 @@ def fused_hidden_mlp(
         raise ValueError("fused_hidden_mlp layer shapes do not compose")
     if b1.shape != (w1.shape[0],) or b2.shape != (w2.shape[0],) or b3.shape != (w3.shape[0],):
         raise ValueError("fused_hidden_mlp bias shapes do not match their weights")
+    shape_key = _mlp_shape_key(x, w1, w2, w3)
+    unsupported_reason = _unsupported_mlp_reason(shape_key)
+    if unsupported_reason is not None:
+        raise RuntimeError(
+            "fused_hidden_mlp is disabled for a previously unsupported device/shape: "
+            f"{unsupported_reason}"
+        )
     return _FusedHiddenMLPFunction.apply(x, w1, b1, w2, b2, w3, b3)
 
 
