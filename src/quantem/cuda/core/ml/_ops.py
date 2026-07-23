@@ -23,6 +23,12 @@ from quantem.cuda import _core
 # ── fused TILTED K-Planes interpolation ───────────────────────────────────
 
 
+def _kplanes_bwd_variant() -> str:
+    """Return the effective backward variant (default 5; 0 selects baseline)."""
+    value = os.environ.get("QUANTEM_KPLANES_BWD_VARIANT")
+    return value if value in {"0", "3", "4", "5"} else "5"
+
+
 def _channels_last(plane: Tensor) -> Tensor:
     """Return a contiguous ``(3T, H, W, C)`` kernel view.
 
@@ -1208,7 +1214,12 @@ def kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor
         pts:       fp32 CUDA tensor ``[B, 3]``, coordinates in ``[-1, 1]``.
         rotations: fp32 CUDA tensor ``[T, 3, 3]``.
         plane:     fp32 CUDA tensor ``[3*T, C, H, W]`` (plane ``t*3 + p``), or
-                   bf16 when ``QUANTEM_KPLANES_BWD_VARIANT`` is 4 or 5.
+                   bf16 under backward variant 4 or 5. Variant 5 is the default;
+                   set ``QUANTEM_KPLANES_BWD_VARIANT=0`` for the baseline kernel.
+
+    The default backward threshold is ``6e-8``. Set
+    ``QUANTEM_KPLANES_BWD_ZERO_TAU`` explicitly (including to ``0``) to
+    override it.
 
     Returns:
         fp32 tensor ``[B, T*C]`` (``out[b, t*C + c]``), differentiable.
@@ -1229,13 +1240,11 @@ def kplanes_tilted_fuse(pts: Tensor, rotations: Tensor, plane: Tensor) -> Tensor
             raise TypeError(f"kplanes_tilted_fuse is fp32-only ({name} is {t.dtype}).")
         if not t.is_cuda:
             raise ValueError(f"kplanes_tilted_fuse requires CUDA tensors ({name} on {t.device}).")
-    bf16_experiment = plane.dtype == torch.bfloat16 and os.environ.get(
-        "QUANTEM_KPLANES_BWD_VARIANT"
-    ) in {"4", "5"}
+    bf16_experiment = plane.dtype == torch.bfloat16 and _kplanes_bwd_variant() in {"4", "5"}
     if plane.dtype != torch.float32 and not bf16_experiment:
         raise TypeError(
             "kplanes_tilted_fuse is fp32-only unless "
-            "QUANTEM_KPLANES_BWD_VARIANT=4 or 5 selects a bf16 plane "
+            "backward variant 4 or 5 selects a bf16 plane "
             f"(plane is {plane.dtype})."
         )
     if not plane.is_cuda:
@@ -1266,6 +1275,11 @@ def kplanes_tilted_fuse_ms(
     scalar gates are applied in the CUDA forward epilogue and at the backward
     upstream-gradient load. Under CUDA bf16 autocast, the kernel stores bf16
     features directly unless ``QUANTEM_KPLANES_MS_BF16_OUT=0``.
+
+    Backward variant 5 and zero threshold ``6e-8`` are the defaults. Set
+    ``QUANTEM_KPLANES_BWD_VARIANT=0`` for the baseline kernel, and set
+    ``QUANTEM_KPLANES_BWD_ZERO_TAU`` explicitly (including to ``0``) to
+    override the threshold.
     """
     name = "kplanes_tilted_fuse_ms"
     if pts.ndim != 2 or pts.shape[-1] != 3:
@@ -1292,13 +1306,11 @@ def kplanes_tilted_fuse_ms(
     grid_dtype = plane0.dtype
     if any(plane.dtype != grid_dtype for plane in planes[1:]):
         raise TypeError(f"{name} requires all three planes to have the same dtype.")
-    bf16_experiment = grid_dtype == torch.bfloat16 and os.environ.get(
-        "QUANTEM_KPLANES_BWD_VARIANT"
-    ) in {"4", "5"}
+    bf16_experiment = grid_dtype == torch.bfloat16 and _kplanes_bwd_variant() in {"4", "5"}
     if grid_dtype != torch.float32 and not bf16_experiment:
         raise TypeError(
-            f"{name} is fp32-only unless QUANTEM_KPLANES_BWD_VARIANT=4 or 5 "
-            f"selects bf16 planes (planes are {grid_dtype})."
+            f"{name} is fp32-only unless backward variant 4 or 5 selects bf16 planes "
+            f"(planes are {grid_dtype})."
         )
     for level, plane in enumerate(planes):
         if not plane.is_cuda or plane.device != pts.device:

@@ -377,7 +377,10 @@ void register_core_ml_ops(py::module_ &m) {
     m.def("kplanes_tilted_fuse_grad_cuda", &py_kplanes_tilted_fuse_grad_cuda,
           "Backward of kplanes_tilted_fuse. gout_ptr: fp32 [B,T*C]. "
           "grid_ptr may be fp32 or bf16; ggrid/gr remain fp32 and are "
-          "accumulated into (pre-zero them); gpts is fully written.",
+          "accumulated into (pre-zero them); gpts is fully written. "
+          "Backward variant 5 with zero_tau=6e-8 is the default; "
+          "QUANTEM_KPLANES_BWD_VARIANT=0 restores the baseline kernel, and "
+          "QUANTEM_KPLANES_BWD_ZERO_TAU (including 0) overrides the threshold.",
           py::arg("pts_ptr"), py::arg("r_ptr"), py::arg("grid_ptr"),
           py::arg("gout_ptr"), py::arg("ggrid_ptr"), py::arg("gr_ptr"),
           py::arg("gpts_ptr"),
@@ -399,7 +402,10 @@ void register_core_ml_ops(py::module_ &m) {
 
     m.def("kplanes_tilted_fuse_ms_grad_cuda", &py_kplanes_tilted_fuse_ms_grad_cuda,
           "Backward of the three-level op. Reads an fp32 or bf16 inner-contiguous gout "
-          "using its row stride and level column offsets.",
+          "using its row stride and level column offsets. Backward variant 5 with "
+          "zero_tau=6e-8 is the default; QUANTEM_KPLANES_BWD_VARIANT=0 restores "
+          "the baseline kernel, and QUANTEM_KPLANES_BWD_ZERO_TAU (including 0) "
+          "overrides the threshold.",
           py::arg("pts_ptr"), py::arg("r_ptr"),
           py::arg("grid0_ptr"), py::arg("grid1_ptr"), py::arg("grid2_ptr"),
           py::arg("gout_ptr"),

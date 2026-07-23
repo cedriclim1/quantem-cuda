@@ -375,9 +375,13 @@ struct KplanesTiltedBwdConfig {
 
 inline const KplanesTiltedBwdConfig &kplanes_tilted_bwd_config() {
     static const KplanesTiltedBwdConfig config = [] {
-        KplanesTiltedBwdConfig result{0, 0.f};
+        // Production default: V5's threshold ballot with the parity-validated
+        // tau. Explicit environment values, including variant 0 and tau 0,
+        // restore the requested baseline/exact behavior.
+        KplanesTiltedBwdConfig result{5, 6e-8f};
         const char *value = std::getenv("QUANTEM_KPLANES_BWD_VARIANT");
         if (value != nullptr && value[0] != '\0' && value[1] == '\0') {
+            if (value[0] == '0') result.variant = 0;
             if (value[0] == '3') result.variant = 3;
             if (value[0] == '4') result.variant = 4;
             if (value[0] == '5') result.variant = 5;

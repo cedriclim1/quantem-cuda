@@ -66,7 +66,7 @@ def ray_points(B, dev, samples_per_ray=200):
 def main():
     assert torch.cuda.is_available()
     dev = torch.device("cuda")
-    variant = os.environ.get("QUANTEM_KPLANES_BWD_VARIANT", "0")
+    variant = os.environ.get("QUANTEM_KPLANES_BWD_VARIANT", "5")
     plane_dtype = torch.bfloat16 if variant == "4" else torch.float32
     print(f"device: {torch.cuda.get_device_name(dev)}\n")
     print(f"backward variant: {variant}; plane dtype: {plane_dtype}\n")

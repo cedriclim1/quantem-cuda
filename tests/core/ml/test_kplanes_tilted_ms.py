@@ -343,7 +343,7 @@ def test_ms_v5_bf16_grid_and_gout_autocast():
 
 @requires_cuda
 @pytest.mark.skipif(
-    os.environ.get("QUANTEM_KPLANES_BWD_VARIANT") not in {"4", "5"},
+    os.environ.get("QUANTEM_KPLANES_BWD_VARIANT", "5") not in {"4", "5"},
     reason="bf16 plane storage is only enabled for backward variants 4 and 5",
 )
 def test_ms_bf16_variant_smoke():
