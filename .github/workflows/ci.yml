@@ -26,20 +26,22 @@ jobs:
         with:
           python-version: "3.12"
       - name: Set up build environment
-        # CPU torch keeps the download small; the nvidia wheels provide nvcc
-        # and libcudart.so.13. Build isolation is disabled so CMake's
-        # site-packages nvcc probe sees the toolkit wheels.
+        # CPU torch keeps the download small; the nvidia wheels provide nvcc,
+        # libcudart.so.13, and libcublasLt.so.13. Build isolation is disabled
+        # so CMake's site-packages nvcc probe sees the toolkit wheels.
         run: |
           uv venv --clear
           uv pip install torch --index-url https://download.pytorch.org/whl/cpu
           uv pip install 'nvidia-cuda-nvcc==13.0.*' 'nvidia-cuda-cccl==13.0.*' \
             'nvidia-cuda-runtime==13.0.*' 'nvidia-cuda-crt==13.0.*' 'nvidia-nvvm==13.0.*' \
+            'nvidia-cublas==13.0.*' \
             'scikit-build-core>=0.11' 'pybind11>=2.12' 'cmake>=3.24' ninja numpy pytest
       - name: Build and install
         run: uv pip install . --no-build-isolation --no-deps -v
       - name: Run tests (GPU tests skip)
-        # libcudart.so.13 comes from the nvidia-cuda-runtime wheel; CPU torch
-        # does not bundle it, so put it on the loader path for the import.
+        # CUDA runtime and cublas libraries come from the nvidia wheels; CPU
+        # torch does not bundle them, so put their shared lib dir on the
+        # loader path.
         run: |
           export LD_LIBRARY_PATH="$(uv run python -c 'import nvidia, os; print(os.path.join(nvidia.__path__[0], "cu13", "lib"))')${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
           uv run pytest tests -v

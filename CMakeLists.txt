@@ -109,6 +109,12 @@ project(quantem_cuda LANGUAGES CXX CUDA)
 
 find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
 find_package(pybind11 CONFIG REQUIRED)
+
+# Preserve a caller-provided cublasLt path before FindCUDAToolkit has a chance
+# to populate its own cache variables.
+if(DEFINED CUDA_cublasLt_LIBRARY AND CUDA_cublasLt_LIBRARY)
+    set(_QUANTEM_CUBLASLT_OVERRIDE "${CUDA_cublasLt_LIBRARY}")
+endif()
 find_package(CUDAToolkit REQUIRED)
 
 # PyTorch cu13 wheels (torch >= 2.9) ship libcudart.so.13; pin the toolkit
@@ -140,7 +146,70 @@ pybind11_add_module(_core
     csrc/cuda/core/ml/cublaslt_mlp.cu
 )
 target_include_directories(_core PRIVATE csrc)
-target_link_libraries(_core PRIVATE CUDA::cudart CUDA::cublasLt)
+
+if(_QUANTEM_CUBLASLT_OVERRIDE)
+    if(NOT EXISTS "${_QUANTEM_CUBLASLT_OVERRIDE}")
+        message(FATAL_ERROR
+            "CUDA_cublasLt_LIBRARY was explicitly set to a nonexistent path: "
+            "${_QUANTEM_CUBLASLT_OVERRIDE}")
+    endif()
+    set(_QUANTEM_CUBLASLT_LINK "${_QUANTEM_CUBLASLT_OVERRIDE}")
+elseif(TARGET CUDA::cublasLt)
+    # Normal system toolkits expose cublasLt through FindCUDAToolkit.
+    set(_QUANTEM_CUBLASLT_LINK CUDA::cublasLt)
+else()
+    set(_QUANTEM_CUBLASLT_HINTS "${CUDAToolkit_LIBRARY_DIR}")
+
+    # nvidia-cublas wheels place libcublasLt beside the other cu13 libraries.
+    foreach(_python_sitelib IN ITEMS "${Python3_SITELIB}" "${Python_SITELIB}")
+        if(_python_sitelib)
+            list(APPEND _QUANTEM_CUBLASLT_HINTS
+                "${_python_sitelib}/nvidia/cu13/lib")
+        endif()
+    endforeach()
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -c
+            "import nvidia, os; print(os.path.join(nvidia.__path__[0], 'cu13', 'lib'))"
+        RESULT_VARIABLE _QUANTEM_NVIDIA_LIB_RESULT
+        OUTPUT_VARIABLE _QUANTEM_NVIDIA_LIB_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_QUANTEM_NVIDIA_LIB_RESULT EQUAL 0 AND _QUANTEM_NVIDIA_LIB_DIR)
+        list(APPEND _QUANTEM_CUBLASLT_HINTS "${_QUANTEM_NVIDIA_LIB_DIR}")
+    endif()
+
+    # A CUDA-enabled torch installation may bundle cublasLt in torch/lib.
+    execute_process(
+        COMMAND "${Python_EXECUTABLE}" -c
+            "import torch, os; print(os.path.join(os.path.dirname(torch.__file__), 'lib'))"
+        RESULT_VARIABLE _QUANTEM_TORCH_LIB_RESULT
+        OUTPUT_VARIABLE _QUANTEM_TORCH_LIB_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(_QUANTEM_TORCH_LIB_RESULT EQUAL 0 AND _QUANTEM_TORCH_LIB_DIR)
+        list(APPEND _QUANTEM_CUBLASLT_HINTS "${_QUANTEM_TORCH_LIB_DIR}")
+    endif()
+
+    list(REMOVE_DUPLICATES _QUANTEM_CUBLASLT_HINTS)
+    find_library(
+        QUANTEM_CUBLASLT_LIB
+        NAMES cublasLt libcublasLt.so.13
+        HINTS ${_QUANTEM_CUBLASLT_HINTS}
+    )
+    if(NOT QUANTEM_CUBLASLT_LIB)
+        list(JOIN _QUANTEM_CUBLASLT_HINTS "\n    " _QUANTEM_CUBLASLT_SEARCHED)
+        message(FATAL_ERROR
+            "Could not find libcublasLt for quantem-cuda. Searched paths:\n"
+            "    ${_QUANTEM_CUBLASLT_SEARCHED}\n"
+            "Install nvidia-cublas==13.0.* or pass "
+            "-DCUDA_cublasLt_LIBRARY=/path/to/libcublasLt.so.13.")
+    endif()
+    set(_QUANTEM_CUBLASLT_LINK "${QUANTEM_CUBLASLT_LIB}")
+endif()
+
+target_link_libraries(_core PRIVATE CUDA::cudart "${_QUANTEM_CUBLASLT_LINK}")
 
 # Force shared libcudart so the symbol resolves to the libcudart already
 # loaded by PyTorch at import time. This is what lets one wheel work across
